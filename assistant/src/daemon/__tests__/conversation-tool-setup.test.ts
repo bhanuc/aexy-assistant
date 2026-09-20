@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { setConfig } from "../../__tests__/helpers/set-config.js";
 import type { Conversation } from "../conversation.js";
 import type { ChannelCapabilities } from "../conversation-runtime-assembly.js";
 
@@ -71,6 +72,10 @@ function makeCtx(
 beforeEach(() => {
   mockClientCountByCapability.clear();
   mockClientsByCapability.clear();
+  // The shipped default. The unattended-policy tests seed their own, and a
+  // leaked seed would silently widen the clientless gate for everything else
+  // in this file.
+  setConfig("conversations", { unattendedQuestions: "proceed" });
 });
 
 describe("isToolActiveForContext - client OS eligibility", () => {
@@ -695,6 +700,49 @@ describe("isToolActiveForContext — ask_question macOS gating", () => {
             clientOS: "web",
           },
         }),
+      ),
+    ).toBe(false);
+  });
+
+  test("an unattended turn gets ask_question when the policy needs it", () => {
+    // The tool is normally hidden with nobody watching, so the model cannot
+    // park a prompt nothing can resolve. But `park` and `fail` make the tool
+    // itself the mechanism for stopping an unattended run rather than letting
+    // it answer its own question — hiding it there makes the policy
+    // unreachable and leaves the guess it exists to prevent.
+    for (const policy of ["park", "fail"]) {
+      setConfig("conversations", { unattendedQuestions: policy });
+      expect(
+        isToolActiveForContext("ask_question", makeCtx({ hasNoClient: true })),
+      ).toBe(true);
+    }
+  });
+
+  test("the unattended policy does not resurrect it on macOS", () => {
+    // macOS still has no handler for a question_request, so the policy cannot
+    // override the surface that could not display one.
+    setConfig("conversations", { unattendedQuestions: "park" });
+    expect(
+      isToolActiveForContext(
+        "ask_question",
+        makeCtx({
+          hasNoClient: true,
+          channelCapabilities: {
+            channel: "macos",
+            supportsDynamicUi: true,
+            clientOS: "macos",
+          },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  test("the unattended policy does not widen any other client-gated tool", () => {
+    setConfig("conversations", { unattendedQuestions: "park" });
+    expect(
+      isToolActiveForContext(
+        "request_system_permission",
+        makeCtx({ hasNoClient: true }),
       ),
     ).toBe(false);
   });

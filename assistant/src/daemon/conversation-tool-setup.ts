@@ -907,7 +907,25 @@ export function isToolActiveForContext(
       // avoids a 5-minute prompter timeout when the LLM would otherwise call it.
       return false;
     }
-    return !hasNoClient;
+    if (!hasNoClient) {
+      return true;
+    }
+    // A turn with nobody watching normally has no business asking, and the
+    // tool stays off the wire so the model cannot park a prompt that nothing
+    // can resolve.
+    //
+    // The exception is a deployment that has said an unattended question must
+    // stop the run rather than be answered by the model
+    // (`conversations.unattendedQuestions`). There the tool IS the mechanism
+    // for stopping: `park` escalates it to the guardian and `fail` refuses
+    // outright, and both report back as a tool error that ends the turn.
+    // Keeping it off the wire in that configuration makes the policy
+    // unreachable and leaves exactly the guess it exists to prevent — which is
+    // what shipping it without this did.
+    return (
+      name === "ask_question" &&
+      getConfig().conversations.unattendedQuestions !== "proceed"
+    );
   }
   if (PLATFORM_TOOL_NAMES.has(name)) {
     // Check the *client's* platform, not the daemon's process.platform.
