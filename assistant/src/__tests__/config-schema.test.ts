@@ -82,6 +82,7 @@ describe("AssistantConfigSchema", () => {
       shellMaxTimeoutSec: 600,
       permissionTimeoutSec: 300,
       questionResponseTimeoutSec: 1800,
+      unattendedQuestionResponseTimeoutSec: 14400,
       toolExecutionTimeoutSec: 120,
       providerStreamTimeoutSec: 1800,
       backgroundTurnTimeoutSec: 1800,

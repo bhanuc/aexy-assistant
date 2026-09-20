@@ -85,6 +85,14 @@ export interface QuestionPromptParams {
   questions: QuestionPromptParamsEntry[];
   toolUseId?: string;
   signal?: AbortSignal;
+  /**
+   * Override the idle backstop, in milliseconds.
+   *
+   * The default suits somebody with the conversation open, who dismisses a
+   * prompt by moving on rather than by waiting it out. A question parked for
+   * an absent person is waiting on a different timescale and says so here.
+   */
+  timeoutMs?: number;
 }
 
 /** One per-question submission inside a batch from the client. */
@@ -223,7 +231,9 @@ export class QuestionPrompter {
     }
 
     const settled = new Promise<QuestionPromptResult>((resolve, reject) => {
-      const timeoutMs = getConfig().timeouts.questionResponseTimeoutSec * 1000;
+      const timeoutMs =
+        params.timeoutMs ??
+        getConfig().timeouts.questionResponseTimeoutSec * 1000;
 
       // Closure-scoped idempotency guard. Every resolution path (timeout,
       // abort, route resolution via `rpcResolve`/`rpcReject`) routes through

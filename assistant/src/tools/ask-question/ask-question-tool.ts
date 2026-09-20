@@ -4,6 +4,7 @@ import type {
   AnsweredQuestion,
   AnsweredQuestionResponse,
 } from "../../api/events/question-answered.js";
+import { getConfig } from "../../config/loader.js";
 import {
   QuestionPrompter,
   type QuestionPromptOutcome,
@@ -140,6 +141,43 @@ const DESCRIPTION = [
  * the id is the machine value the card would return, meaningless to a user
  * typing a free-text answer.
  */
+/**
+ * What the model is told when an unattended question will not be asked.
+ *
+ * Deliberately specific about *why*, and deliberately an error rather than a
+ * result: the run should stop here. A vague refusal invites the model to treat
+ * this as a soft obstacle and carry on with an assumption, which is the exact
+ * behaviour the `park`/`fail` policies exist to prevent.
+ *
+ * The questions come back with it so the person reading the failed run sees
+ * what the assistant wanted to know, rather than only that it wanted something.
+ */
+export function unattendedRefusal(
+  policy: "park" | "fail",
+  reachable: boolean,
+  questions: SingleQuestion[],
+): string {
+  const why =
+    policy === "fail"
+      ? "This turn has no interactive user, and this assistant is configured not to ask one (conversations.unattendedQuestions=fail)."
+      : !reachable
+        ? "This turn has no interactive user, and the question could not be escalated to anyone: parking needs a single question, a guardian turn, and a channel that renders option cards (conversations.unattendedQuestions=park)."
+        : "This turn has no interactive user.";
+
+  return [
+    why,
+    "Do not answer this question yourself and do not proceed on an assumption. Stop and report that you are blocked, stating what you needed to know.",
+    "",
+    "What you were asking:",
+    ...questions.map(
+      (q, i) =>
+        `${questions.length > 1 ? `${i + 1}. ` : ""}${q.question}${
+          q.description ? ` — ${q.description}` : ""
+        }`,
+    ),
+  ].join("\n");
+}
+
 export function formatQuestionsAsTextFallback(
   questions: SingleQuestion[],
 ): string {
@@ -236,37 +274,66 @@ export const askQuestionTool = {
 
     const questions: SingleQuestion[] = parsed.data.questions;
 
-    // No interactive user is present to answer (scheduled/headless/background
-    // turn). Don't park the turn on a prompt no one can resolve — proceed with
-    // defaults immediately. Non-interactive turns are already instructed not to
-    // ask (NON_INTERACTIVE_CONTEXT_BLOCK); this is the backstop for when the
-    // model asks anyway, so it doesn't wait out the full response timeout.
-    if (context.isInteractive === false) {
-      return {
-        content:
-          "No interactive user is present to answer; proceeding with reasonable defaults.",
-        isError: false,
-      };
-    }
-
-    // Channel turns (no dynamic UI) park only when the question can reach the
-    // user as a guardian-request card with tappable options: a single-question
-    // batch, asked by the guardian, on a channel whose notification adapter
-    // renders card actions. The prompter's promotion then delivers the card
-    // through the guardian-request pipeline, and a tap / request-code reply /
-    // bare-text answer resolves the parked prompt.
+    // Whether the question can reach a person as a guardian-request card with
+    // tappable options: a single-question batch, asked by the guardian, on a
+    // channel whose notification adapter renders card actions. The prompter's
+    // promotion delivers it, and a tap / request-code reply / bare-text answer
+    // resolves the parked prompt.
     //
-    // Every other channel turn degrades to text: hand the model the formatted
-    // question(s) and options to present in its reply — which IS what gets
-    // delivered to the channel — and wait for a free-text answer. Mirrors the
-    // isInteractive guard above: return immediately instead of parking on a
-    // prompt the surface can't answer. (UI surface tools like ui_show are
-    // instead dropped from the wire for these channels; ask_question stays
-    // available because a question with options reads cleanly as text.)
+    // Hoisted above the non-interactive branch because it is also the test for
+    // whether parking an unattended question would reach anybody at all.
     const canDeliverGuardianQuestionCard =
       questions.length === 1 &&
       context.trustClass === "guardian" &&
       context.supportsGuardianQuestionCards === true;
+
+    // No interactive user is present (scheduled/headless/background turn).
+    // What to do about that is policy, because the right answer depends on
+    // what the turn is for. A background chore should carry on with a sensible
+    // default rather than stall. Work somebody is accountable for should not:
+    // "these figures are 40% off last quarter, is that expected?" is precisely
+    // the question that ought to stop a run, and answering it by guessing is
+    // how an unattended agent does something nobody sanctioned.
+    //
+    // Non-interactive turns are already instructed not to ask
+    // (NON_INTERACTIVE_CONTEXT_BLOCK); this is what happens when one asks
+    // anyway.
+    if (context.isInteractive === false) {
+      const policy = getConfig().conversations.unattendedQuestions;
+
+      if (policy === "proceed") {
+        return {
+          content:
+            "No interactive user is present to answer; proceeding with reasonable defaults.",
+          isError: false,
+        };
+      }
+
+      // `park` degrades to `fail` rather than to `proceed` when there is no
+      // way to reach a person. Falling back to proceeding would turn the
+      // safest setting into the least safe one exactly when the escalation
+      // path is broken, which is when it matters most.
+      if (policy === "fail" || !canDeliverGuardianQuestionCard) {
+        return {
+          content: unattendedRefusal(
+            policy,
+            canDeliverGuardianQuestionCard,
+            questions,
+          ),
+          isError: true,
+        };
+      }
+      // `park`: fall through to the prompter, which promotes the question to
+      // the guardian and waits.
+    }
+
+    // Every other channel turn degrades to text: hand the model the formatted
+    // question(s) and options to present in its reply — which IS what gets
+    // delivered to the channel — and wait for a free-text answer. Return
+    // immediately instead of parking on a prompt the surface can't answer.
+    // (UI surface tools like ui_show are instead dropped from the wire for
+    // these channels; ask_question stays available because a question with
+    // options reads cleanly as text.)
     if (
       context.supportsDynamicUi === false &&
       !canDeliverGuardianQuestionCard
@@ -283,6 +350,14 @@ export const askQuestionTool = {
       questions,
       toolUseId: context.toolUseId,
       signal: context.signal,
+      // A parked question is waiting on somebody who may be asleep, not on
+      // somebody with the card in front of them.
+      ...(context.isInteractive === false
+        ? {
+            timeoutMs:
+              getConfig().timeouts.unattendedQuestionResponseTimeoutSec * 1000,
+          }
+        : {}),
     });
 
     // Format the aggregated transcript. Each line is keyed by the original

@@ -20,6 +20,15 @@ export const ConversationsConfigSchema = z
       .describe(
         "Inner text injected into the tail user message of non-interactive turns in background/scheduled conversations. The injector wraps this in <background_turn>...</background_turn> tags. Empty string disables the injection.",
       ),
+    unattendedQuestions: z
+      .enum(["proceed", "park", "fail"], {
+        error:
+          "conversations.unattendedQuestions must be proceed, park or fail",
+      })
+      .default("proceed")
+      .describe(
+        "What ask_question does when no interactive user is present (scheduled/headless/background turn). 'proceed' returns immediately and lets the model carry on with its own default — right for a background chore, wrong for work somebody is accountable for. 'park' escalates the question to the guardian through the notification pipeline and waits for an answer, failing the tool call if nobody answers in time. 'fail' refuses immediately without asking anyone. Both 'park' and 'fail' stop the turn rather than letting it proceed on a guess.",
+      ),
     resumeProcessingOnStartup: z
       .boolean({
         error: "conversations.resumeProcessingOnStartup must be a boolean",

@@ -36,6 +36,18 @@ export const TimeoutConfigSchema = z
       .describe(
         "Backstop timeout for an unanswered ask_question prompt (seconds). The primary way an interactive user dismisses a prompt is by moving on — enqueuing another message supersedes it — so this only bounds a prompt left open with no response and no follow-up message.",
       ),
+    unattendedQuestionResponseTimeoutSec: z
+      .number({
+        error: "timeouts.unattendedQuestionResponseTimeoutSec must be a number",
+      })
+      .finite("timeouts.unattendedQuestionResponseTimeoutSec must be finite")
+      .positive(
+        "timeouts.unattendedQuestionResponseTimeoutSec must be a positive number",
+      )
+      .default(14_400)
+      .describe(
+        "How long a parked ask_question waits when no interactive user is present (seconds). Separate from questionResponseTimeoutSec because the interactive backstop assumes somebody who has the conversation open and moves on; this one is waiting for a person who may be asleep, so it is measured in hours. Bounded rather than infinite: a run blocked on a question nobody will answer should eventually fail instead of holding its resources forever.",
+      ),
     toolExecutionTimeoutSec: z
       .number({ error: "timeouts.toolExecutionTimeoutSec must be a number" })
       .finite("timeouts.toolExecutionTimeoutSec must be finite")

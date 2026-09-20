@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { setConfig } from "../../__tests__/helpers/set-config.js";
 import type {
   QuestionPromptOutcome,
   QuestionPromptParams,
@@ -65,6 +66,8 @@ beforeEach(() => {
     entries: [{ questionId: "q1", decision: "skipped" }],
     overall: "completed",
   };
+  // The shipped default. Individual policy tests seed their own.
+  setConfig("conversations", { unattendedQuestions: "proceed" });
 });
 
 // A single question used to build batches. The tool only accepts the
@@ -823,5 +826,128 @@ describe("answered-question record", () => {
         overall: "timed_out",
       }),
     ).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unattended question policy
+//
+// A turn with nobody watching used to carry on with whatever the model
+// assumed. That is right for a background chore and wrong for work somebody is
+// accountable for, so what happens is policy. The rule these tests hold is
+// that neither of the careful settings can end in a guess.
+// ---------------------------------------------------------------------------
+
+describe("unattended question policy", () => {
+  /** A turn with no human watching, on a channel that can show option cards. */
+  function unattendedReachable(): ToolContext {
+    return makeContext({
+      isInteractive: false,
+      trustClass: "guardian",
+      supportsGuardianQuestionCards: true,
+      supportsDynamicUi: false,
+    });
+  }
+
+  test("proceed is the default and keeps the old behaviour", async () => {
+    const result = await askQuestionTool.execute(
+      validInput,
+      unattendedReachable(),
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(false);
+    expect(result.content.toLowerCase()).toContain("no interactive user");
+  });
+
+  test("fail refuses without asking anyone, and says so as an error", async () => {
+    setConfig("conversations", { unattendedQuestions: "fail" });
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      unattendedReachable(),
+    );
+
+    expect(calls).toHaveLength(0);
+    // An error, not a result: the run has to stop here rather than read this
+    // as a soft obstacle and carry on.
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("unattendedQuestions=fail");
+    // The question travels with the refusal, so whoever reads the failed run
+    // sees what the assistant needed to know.
+    expect(result.content).toContain("Which fruit?");
+    expect(result.content.toLowerCase()).toContain(
+      "do not answer this question",
+    );
+  });
+
+  test("park escalates instead of guessing, and waits on the unattended clock", async () => {
+    setConfig("conversations", { unattendedQuestions: "park" });
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      unattendedReachable(),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(result.isError).toBe(false);
+    // Four hours by default, not the interactive half-hour: this is waiting on
+    // somebody who may be asleep, not somebody with the card in front of them.
+    expect(calls[0]!.timeoutMs).toBe(14_400_000);
+  });
+
+  test("park fails closed when the question could not reach anybody", async () => {
+    // Parking needs a single question, a guardian turn and a channel that
+    // renders option cards. Without them there is nobody to park for, and
+    // falling back to `proceed` would make the safest setting the least safe
+    // one exactly when its escalation path is broken.
+    setConfig("conversations", { unattendedQuestions: "park" });
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({
+        isInteractive: false,
+        trustClass: "guardian",
+        supportsGuardianQuestionCards: false,
+      }),
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("could not be escalated");
+  });
+
+  test("a parked question nobody answers fails rather than proceeding", async () => {
+    setConfig("conversations", { unattendedQuestions: "park" });
+    setNextResult({
+      entries: [{ questionId: "q1", decision: "timed_out" }],
+      overall: "timed_out",
+    });
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      unattendedReachable(),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(result.isError).toBe(true);
+  });
+
+  test("the policy does not touch a turn that has somebody watching", async () => {
+    // `fail` is about the absence of a human, not a mood. An interactive turn
+    // prompts regardless of what the unattended policy says.
+    setConfig("conversations", { unattendedQuestions: "fail" });
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({ isInteractive: true }),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(result.isError).toBe(false);
+    // And it waits on the interactive clock, not the four-hour one.
+    expect(calls[0]!.timeoutMs).toBeUndefined();
   });
 });
