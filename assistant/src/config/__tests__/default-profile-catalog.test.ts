@@ -59,22 +59,27 @@ describe("getEffectiveProfiles", () => {
     }
   });
 
-  test("the managed Balanced profile routes GLM 5.3 Flash through Fireworks", () => {
-    const balanced = CODE_DEFAULT_PROFILE_ENTRIES.balanced;
-    expect(balanced.model).toBe("accounts/fireworks/models/glm-5p3-flash");
-    expect(resolveRoutingIdentity(balanced.provider, balanced.model)).toEqual({
-      connectionName: "vellum",
-      expectedProvider: "fireworks",
-    });
+  test("every managed profile routes DeepSeek Flash through DeepSeek", () => {
+    // This fork's managed connection serves DeepSeek, so the whole vellum
+    // column pins it. The profiles differ in effort and token budget, which
+    // is theirs to set, rather than in the model.
+    for (const key of ["balanced", "quality-optimized", "cost-optimized"]) {
+      const profile = CODE_DEFAULT_PROFILE_ENTRIES[key];
+      expect(profile.model).toBe("deepseek-flash");
+      expect(resolveRoutingIdentity(profile.provider, profile.model)).toEqual({
+        connectionName: "vellum",
+        expectedProvider: "deepseek",
+      });
+    }
   });
 
-  test("the managed Quality profile routes GPT-5.6 Sol through OpenAI", () => {
-    const quality = CODE_DEFAULT_PROFILE_ENTRIES["quality-optimized"];
-    expect(quality.model).toBe("gpt-5.6-sol");
-    expect(resolveRoutingIdentity(quality.provider, quality.model)).toEqual({
-      connectionName: "vellum",
-      expectedProvider: "openai",
-    });
+  test("the managed backups stay on other upstreams", () => {
+    // A backup exists for the case where the primary's provider is down, so
+    // pinning it at the same upstream would make the fallback pointless.
+    const backup = CODE_DEFAULT_PROFILE_ENTRIES["balanced-backup"];
+    const identity = resolveRoutingIdentity(backup.provider, backup.model);
+    expect(identity).not.toBeNull();
+    expect(identity?.expectedProvider).not.toBe("deepseek");
   });
 
   test("defaults absent from the workspace resolve from the catalog; os-beta stays flag-gated", () => {

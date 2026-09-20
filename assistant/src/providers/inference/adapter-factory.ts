@@ -33,6 +33,7 @@ import { getLogger } from "../../util/logger.js";
 import { AnthropicProvider } from "../anthropic/client.js";
 import { AtlasCloudProvider } from "../atlascloud/client.js";
 import { BasetenProvider } from "../baseten/client.js";
+import { DeepSeekProvider } from "../deepseek/client.js";
 import { FireworksProvider } from "../fireworks/client.js";
 import { GeminiProvider } from "../gemini/client.js";
 import { MinimaxProvider } from "../minimax/client.js";
@@ -136,6 +137,11 @@ const ADAPTER_FACTORIES: Record<string, AdapterFactory> = {
     }),
   fireworks: ({ apiKey, model, streamTimeoutMs, baseURL }) =>
     new FireworksProvider(apiKey, model, {
+      streamTimeoutMs,
+      ...(baseURL ? { baseURL } : {}),
+    }),
+  deepseek: ({ apiKey, model, streamTimeoutMs, baseURL }) =>
+    new DeepSeekProvider(apiKey, model, {
       streamTimeoutMs,
       ...(baseURL ? { baseURL } : {}),
     }),

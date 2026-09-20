@@ -56,6 +56,11 @@ export const PLATFORM_PROVIDER_META: Record<string, ManagedProviderMeta> = {
     managed: true,
     proxyPath: "/v1/runtime-proxy/vellum",
   },
+  deepseek: {
+    name: "deepseek",
+    managed: true,
+    proxyPath: "/v1/runtime-proxy/deepseek",
+  },
   poolside: {
     name: "poolside",
     managed: false,

@@ -2524,6 +2524,40 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     apiKeyPlaceholder: "Your Poolside API key",
   },
   {
+    id: "deepseek",
+    displayName: "DeepSeek",
+    subtitle: "DeepSeek's own API, through the managed connection.",
+    setupMode: "api-key",
+    setupHint:
+      "Served through the platform's managed connection; no bring-your-own key is needed.",
+    apiKeyUrl: "https://platform.deepseek.com/api_keys",
+    apiKeyPlaceholder: "Your DeepSeek API key",
+    models: [
+      {
+        // V4.1 Flash. `deepseek-chat` and `deepseek-reasoner` are legacy
+        // aliases the API still accepts and answers from this model, so they
+        // are deliberately not listed as models of their own: a profile
+        // pinning one would name a model nobody runs.
+        id: "deepseek-flash",
+        displayName: "DeepSeek V4.1 Flash",
+        contextWindowTokens: 1_000_000,
+        maxOutputTokens: 384_000,
+        supportsThinking: true,
+        supportsCaching: true,
+        supportsVision: true,
+        supportsToolUse: true,
+        // Peak rates. DeepSeek halves every rate off-peak and this table has
+        // no time of day, so the higher tier is the honest one to quote.
+        pricing: {
+          inputPer1mTokens: 0.3,
+          outputPer1mTokens: 1.2,
+          cacheReadPer1mTokens: 0.006,
+        },
+      },
+    ],
+    defaultModel: "deepseek-flash",
+  },
+  {
     id: "vellum",
     displayName: "Vellum",
     subtitle:
@@ -2655,8 +2689,7 @@ export function supportsForcedToolChoiceWithThinking(
   return !provider.models.some(
     (model) =>
       model.supportsForcedToolChoiceWithThinking === false &&
-      (model.id === modelId ||
-        stripDateSuffix(model.id) === normalizedModelId),
+      (model.id === modelId || stripDateSuffix(model.id) === normalizedModelId),
   );
 }
 

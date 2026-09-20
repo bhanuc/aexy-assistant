@@ -27,6 +27,9 @@ mock.module("../registry.js", () => ({
 // ── Imports (after mocks) ───────────────────────────────────────────────────
 
 import { CODE_DEFAULT_PROFILE_ENTRIES } from "../../config/default-profile-catalog.js";
+import { resolveDefaultProfileForProvider } from "../../config/default-profile-catalog.js";
+import { getConfig } from "../../config/loader.js";
+import type { DefaultProviderConfig } from "../../config/schemas/llm.js";
 import { getDb } from "../../persistence/db-connection.js";
 import { initializeDb } from "../../persistence/db-init.js";
 import { resetSubagentAttributionCacheForTests } from "../../usage/subagent-attribution.js";
@@ -375,7 +378,21 @@ describe("RetryProvider — callSite resolution", () => {
     // resolved from the code-owned catalog.
     setLlmConfig({});
 
-    const expected = CODE_DEFAULT_PROFILE_ENTRIES["cost-optimized"];
+    // What is under test is the *fallback* -- that an absent `callSites` entry
+    // falls through to the call site's default profile -- not which provider
+    // column that profile comes from. So the expectation is resolved the same
+    // way the code resolves it, against whatever default provider is in
+    // effect. Reading the managed column directly instead only agreed with the
+    // resolver while two columns happened to pin the same model id.
+    const expected = resolveDefaultProfileForProvider(
+      undefined,
+      "cost-optimized",
+      (getConfig().llm?.defaultProvider as DefaultProviderConfig | null) ??
+        null,
+    );
+    if (expected == null) {
+      throw new Error("cost-optimized must resolve for the default provider");
+    }
     let seen: SendMessageOptions | undefined;
     const wrapped = new RetryProvider(
       makeProvider(expected.provider as string, (options) => {

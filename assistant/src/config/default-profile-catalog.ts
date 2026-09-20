@@ -82,10 +82,16 @@ type ProfileImpls = Record<DefaultProfileKey, DefaultProfileTemplate>;
  * provider can be served by re-sending on the backup. Vellum column only:
  * the BYOK and chatgpt columns carry no pointers, since those installs may
  * hold no credential for the backup's provider.
+ *
+ * This fork pins every primary to `deepseek-flash`, which is what the Aexy
+ * platform's managed connection actually serves. The four profiles still
+ * differ, in the knobs that are theirs to set -- token budget, effort and
+ * thinking -- rather than in the model, and the backups stay on other
+ * upstreams so a DeepSeek outage still has somewhere to go.
  */
 const VELLUM_PROFILE_IMPLS: ProfileImpls = {
   balanced: {
-    model: "accounts/fireworks/models/glm-5p3-flash",
+    model: "deepseek-flash",
     provider: "vellum",
     source: "managed",
     label: "Balanced",
@@ -99,7 +105,7 @@ const VELLUM_PROFILE_IMPLS: ProfileImpls = {
     },
   },
   "quality-optimized": {
-    model: "gpt-5.6-sol",
+    model: "deepseek-flash",
     provider: "vellum",
     source: "managed",
     label: "Quality",
@@ -113,7 +119,7 @@ const VELLUM_PROFILE_IMPLS: ProfileImpls = {
     },
   },
   "cost-optimized": {
-    model: "accounts/fireworks/models/deepseek-v4-flash-0731",
+    model: "deepseek-flash",
     provider: "vellum",
     source: "managed",
     label: "Budget",
@@ -146,7 +152,7 @@ const VELLUM_PROFILE_IMPLS: ProfileImpls = {
     // `provider` below is the provider-agnostic managed sentinel, so
     // `getManagedUpstream` resolves the real upstream from the model's catalog
     // owner. This model is the one live-voice TTFT drives validated.
-    model: "gpt-5.6-luna",
+    model: "deepseek-flash",
     provider: "vellum",
     source: "managed",
     label: "Fast",

@@ -69,6 +69,7 @@ describe("vellum-model-routing", () => {
     // Guards against drift if PLATFORM_PROVIDER_META changes.
     expect([...MANAGED_ROUTABLE_PROVIDERS].sort()).toEqual([
       "anthropic",
+      "deepseek",
       "fireworks",
       "gemini",
       "openai",
