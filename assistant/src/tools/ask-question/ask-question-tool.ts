@@ -152,6 +152,101 @@ const DESCRIPTION = [
  * The questions come back with it so the person reading the failed run sees
  * what the assistant wanted to know, rather than only that it wanted something.
  */
+/**
+ * Put an unattended question into the workspace inbox and wait for a person.
+ *
+ * Returns the tool result when the inbox settled the question one way or the
+ * other, and `null` when it could not be reached at all — which leaves the
+ * caller to refuse exactly as it would have without this path. The
+ * distinction matters: "nobody answered in four hours" and "we could not ask
+ * anybody" are different things to tell a model, and only the first is a
+ * decision the workspace actually made.
+ */
+/**
+ * A request id for a prompt that has no tool_use id of its own.
+ *
+ * Deterministic rather than random, because the whole point of the id is that
+ * asking the same thing twice does not put it in front of somebody twice.
+ * djb2 — this is a dedupe key, not a security boundary, and dragging in a
+ * hash implementation for it would be out of proportion.
+ */
+function stableRequestId(
+  conversationId: string,
+  questions: SingleQuestion[],
+): string {
+  const material = questions.map((q) => q.question).join("\u001f");
+  let hash = 5381;
+  for (let i = 0; i < material.length; i += 1) {
+    hash = ((hash << 5) + hash + material.charCodeAt(i)) >>> 0;
+  }
+  return `ask_${conversationId}_${hash.toString(36)}`;
+}
+
+async function askTheWorkspace(
+  questions: SingleQuestion[],
+  context: ToolContext,
+): Promise<ToolExecutionResult | null> {
+  const { parkInWorkspaceInbox } = await import("./workspace-inbox.js");
+
+  // The same ids the prompter would have assigned, so an answer that comes
+  // back through the inbox is keyed the way everything else in this file
+  // expects. The LLM never sees them.
+  const questionIds = questions.map((_, index) => `q${index + 1}`);
+
+  const result = await parkInWorkspaceInbox({
+    questions,
+    questionIds,
+    // Idempotency and return address in one, so a pod that parks, drops its
+    // connection and parks again lands on the same question rather than
+    // asking the same person twice.
+    //
+    // The tool_use id is the right key when there is one: unique per prompt
+    // and stable across a retry of the same call. When there is not, the
+    // conversation plus a digest of the questions has the same property for
+    // the same reason — the same question asked again in the same
+    // conversation is the same question.
+    requestId:
+      context.toolUseId ?? stableRequestId(context.conversationId, questions),
+    timeoutMs: getConfig().timeouts.unattendedQuestionResponseTimeoutSec * 1000,
+    signal: context.signal,
+  });
+
+  if (result.outcome === "unavailable") {
+    return null;
+  }
+
+  if (result.outcome === "expired" || result.outcome === "timeout") {
+    return {
+      content:
+        result.outcome === "expired"
+          ? "This question was put to the workspace and nobody answered it before its deadline, so it has expired. Stop here and report what you were unable to decide — do not pick one of the options yourself."
+          : "This question is still with the workspace and nobody has answered it yet. Stop here and report what you are waiting on — do not pick one of the options yourself.",
+      isError: true,
+    };
+  }
+
+  const byId = new Map(result.responses.map((r) => [r.questionId, r]));
+  const lines = questions.map((question, index) => {
+    const answer = byId.get(questionIds[index]!);
+    const prefix = `Question "${question.question}" →`;
+    if (!answer || answer.decision === "skipped") {
+      // Carried through as a skip rather than dropped. "They looked and
+      // declined" is information; a gap is an invitation to fill it in.
+      return `${prefix} the person chose not to answer this one.`;
+    }
+    if (answer.decision === "option") {
+      const chosen = question.options.find((o) => o.id === answer.optionId);
+      return `${prefix} ${chosen?.label ?? answer.optionId}`;
+    }
+    return `${prefix} ${answer.text ?? ""}`;
+  });
+
+  return {
+    content: `Answered from the workspace inbox:\n${lines.join("\n")}`,
+    isError: false,
+  };
+}
+
 export function unattendedRefusal(
   policy: "park" | "fail",
   reachable: boolean,
@@ -307,6 +402,20 @@ export const askQuestionTool = {
             "No interactive user is present to answer; proceeding with reasonable defaults.",
           isError: false,
         };
+      }
+
+      // `park`, with no channel that renders option cards: the workspace
+      // inbox. This is the common case rather than the exotic one — most
+      // assistants have no messaging channel at all — so without it the
+      // safest policy was also the one that most often reached nobody.
+      if (policy === "park" && !canDeliverGuardianQuestionCard) {
+        const viaInbox = await askTheWorkspace(questions, context);
+        if (viaInbox !== null) {
+          return viaInbox;
+        }
+        // Fall through to the refusal below. Not reaching the inbox is the
+        // same situation as not having a channel, and the answer to it is
+        // the same: stop.
       }
 
       // `park` degrades to `fail` rather than to `proceed` when there is no
