@@ -11,14 +11,36 @@ export interface HandoffOptions {
 }
 
 /**
+ * What offering control to the user actually did.
+ *
+ * Deliberately not a boolean "success": a handoff that happened says nothing
+ * about whether the user did the thing. `handed_over` means only that control
+ * was offered and came back — by a navigation, by a timeout, or by the page
+ * closing, which are indistinguishable from here. A caller that needs to know
+ * whether the obstacle is gone has to look at the page.
+ */
+export type HandoffOutcome =
+  /** Control was offered to the user and has come back. */
+  | "handed_over"
+  /**
+   * Nobody was watching this conversation's browser, so control was never
+   * offered and no time was spent waiting.
+   */
+  | "no_viewer";
+
+/**
  * Hand control to the user by enabling interactive mode and waiting for them to finish.
  * The browser window is brought to the front, and we wait for the user to complete
  * the action (detected via URL change) or a 5-minute timeout.
+ *
+ * Returns what happened, because a handoff with nobody watching returns
+ * immediately and a caller that assumed otherwise would report a challenge as
+ * cleared while it was still on screen.
  */
 export async function startHandoff(
   conversationId: string,
   options: HandoffOptions,
-): Promise<void> {
+): Promise<HandoffOutcome> {
   log.info(
     { conversationId, reason: options.reason },
     "Starting handoff to user",
@@ -36,7 +58,7 @@ export async function startHandoff(
 
   if (!isScreencastActive(conversationId)) {
     log.warn({ conversationId }, "No active browser page for handoff");
-    return;
+    return "no_viewer";
   }
 
   browserManager.setInteractiveMode(conversationId, true);
@@ -45,4 +67,5 @@ export async function startHandoff(
   await browserManager.waitForHandoffComplete(conversationId);
 
   log.info({ conversationId }, "Handoff complete, agent resuming");
+  return "handed_over";
 }

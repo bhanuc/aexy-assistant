@@ -1265,14 +1265,27 @@ export async function executeBrowserNavigate(
           // AND a sender is registered. The extension path falls back
           // to the text-only "solve manually" branch because the user
           // already owns their Chrome window.
+          let cleared = false;
           if (cdp.kind === "local" && sender) {
             const { startHandoff } = await import("./browser-handoff.js");
-            await startHandoff(context.conversationId, {
+            const outcome = await startHandoff(context.conversationId, {
               reason: "captcha",
               message:
                 "Cloudflare verification detected. Please solve the CAPTCHA in the Chrome window. The browser will automatically detect when you're done and resume.",
               bringToFront: true,
             });
+            // Whether the challenge is gone is not something the handoff can
+            // report. It returns on a navigation, on a five-minute timeout, or
+            // immediately when nobody was watching, and a user who gave up
+            // looks like all three. So ask the page rather than assume: saying
+            // "solved by user" over a CAPTCHA still on screen sends the model
+            // on to parse a challenge page as though it were the destination.
+            cleared =
+              outcome === "handed_over" &&
+              !(await detectCaptchaChallenge(cdp, context.signal));
+          }
+
+          if (cleared) {
             const newUrl = await readPageUrl(cdp, context.signal);
             const newTitle = await readPageTitle(cdp, context.signal);
             lines.push("");
