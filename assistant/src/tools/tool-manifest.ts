@@ -11,6 +11,11 @@ import {
   recallTool,
   rememberTool,
 } from "../plugins/defaults/memory/tools.js";
+import {
+  releaseTaskTool,
+  reportTaskProgressTool,
+  submitTaskTool,
+} from "../workspace-tasks/task-tools.js";
 import { askQuestionTool } from "./ask-question/ask-question-tool.js";
 import { reactToMessageTool } from "./channel/react-to-message.js";
 import { fileEditTool } from "./filesystem/edit.js";
@@ -68,6 +73,13 @@ export const explicitTools: ToolDefinition[] = [
   deleteMemoryPageTool,
   notifyParentTool,
   askQuestionTool,
+  // How a turn working a workspace card says what became of it. Present on
+  // every turn rather than only on a task turn: outside one they refuse with
+  // a sentence saying there is no task, which is clearer than a tool that
+  // appears and disappears.
+  reportTaskProgressTool,
+  submitTaskTool,
+  releaseTaskTool,
   reactToMessageTool,
   sendUserMessageTool,
   hostFileReadTool,

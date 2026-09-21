@@ -29,6 +29,7 @@ import { readTextFileSync } from "../util/fs.js";
 import { getLogger } from "../util/logger.js";
 import { getWorkspaceDir, getWorkspacePromptPath } from "../util/platform.js";
 import { stripCommentLines } from "../util/strip-comment-lines.js";
+import { runNextWorkspaceTask } from "../workspace-tasks/runner.js";
 import {
   completeHeartbeatRun,
   countCompletedHeartbeatRuns,
@@ -804,6 +805,26 @@ export class HeartbeatService {
     log.info("Running heartbeat");
 
     startHeartbeatRun(runId);
+
+    // Work assigned on the workspace board comes first, and instead of the
+    // beat rather than alongside it. A pod runs one browser and one shell; a
+    // heartbeat turn and a task turn competing for them is how two pieces of
+    // work corrupt each other's state.
+    //
+    // This is also the whole of how a pod finds out it has been given
+    // something. There is no push — a sleeping pod cannot receive one — so
+    // the wake that already exists is the wake that checks. Latency is one
+    // heartbeat interval, which for a card on a board is not a number anybody
+    // notices.
+    const taskRun = await runNextWorkspaceTask();
+    if (taskRun.ran) {
+      log.info(
+        { taskId: taskRun.taskId, settled: taskRun.settled },
+        "Heartbeat spent on a workspace task",
+      );
+      completeHeartbeatRun(runId, { status: "ok" });
+      return;
+    }
 
     const latenessMs = Date.now() - scheduledFor;
     const LATE_THRESHOLD_MS = 5 * 60 * 1000;
