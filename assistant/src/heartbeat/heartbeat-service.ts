@@ -826,6 +826,14 @@ export class HeartbeatService {
       return;
     }
 
+    // Say why the beat was not spent on a card. Most of the reasons are
+    // ordinary — an empty queue, somebody else got there first — and debug
+    // is the right level for them. But "not connected to a workspace" is a
+    // misconfiguration, and without this line it looks exactly like an empty
+    // queue from outside: the pod simply never picks anything up and nothing
+    // anywhere says so.
+    log.debug({ reason: taskRun.reason }, "No workspace task this beat");
+
     const latenessMs = Date.now() - scheduledFor;
     const LATE_THRESHOLD_MS = 5 * 60 * 1000;
 
