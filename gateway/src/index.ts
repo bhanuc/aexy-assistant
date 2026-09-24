@@ -211,7 +211,11 @@ import { createDiscordInboundEventHandler } from "./discord/forward.js";
 import { handleInbound } from "./handlers/handle-inbound.js";
 import { upsertContactChannel } from "./verification/contact-helpers.js";
 import { checkAuthRateLimit } from "./http/middleware/rate-limit.js";
-import { logAuthBypassState } from "./http/middleware/auth.js";
+import {
+  logAuthBypassState,
+  wrapWithAuthFailureTracking,
+} from "./http/middleware/auth.js";
+import { createLiveViewRoutes } from "./http/routes/live-routes.js";
 import {
   resolveExtensionOrigin,
   handleExtensionPreflight,
@@ -1968,6 +1972,18 @@ async function main() {
       { path: /^\/v1\/assistants\/[^/]+\/desktop\/setup\/?$/, ...setupRoute },
     );
   }
+
+  // Aexy live view (`aexy-live-view`): service routes the daemon serves, which
+  // with the flag off fall through to the catch-all below exactly as upstream.
+  routes.push(
+    ...createLiveViewRoutes(config, (req, getClientIp) =>
+      wrapWithAuthFailureTracking(
+        (r) => handleRuntimeProxy(r, getClientIp()),
+        authRateLimiter,
+        getClientIp,
+      )(req),
+    ),
+  );
 
   // Runtime proxy catch-all — must be last so specific routes are checked first.
   routes.push({
