@@ -6,7 +6,7 @@
  * last one leaves so a reconnect is instant.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { readAvatarState } from "../avatar/avatar-manifest.js";
@@ -187,6 +187,13 @@ interface DesktopSessionManagerOptions {
    * (see `live/live-view-feature.ts`); upstream's desktop never opens one.
    */
   readonly remoteDebuggingPort?: () => number | null;
+  /**
+   * HOME for the children when the daemon's own is not writable. A managed
+   * pod's root filesystem is read-only, and Chrome's crash handler exits the
+   * browser at launch when it cannot write under HOME.
+   */
+  readonly fallbackHomeDir?: string;
+  readonly isWritableDir?: (path: string) => boolean;
 }
 
 /** What a watcher is told about the desktop. */
@@ -242,6 +249,8 @@ export class DesktopSessionManager {
   >;
   private readonly sourceEnv: NodeJS.ProcessEnv;
   private readonly remoteDebuggingPort: () => number | null;
+  private readonly fallbackHomeDir: string;
+  private readonly isWritableDir: (path: string) => boolean;
 
   constructor(options: DesktopSessionManagerOptions = {}) {
     this.spawn = options.spawn ?? spawnDetached;
@@ -274,6 +283,9 @@ export class DesktopSessionManager {
     this.remoteDebuggingPort =
       options.remoteDebuggingPort ??
       (() => (isLiveViewEnabled() ? DESKTOP_CDP_PORT : null));
+    this.fallbackHomeDir =
+      options.fallbackHomeDir ?? join(getDataDir(), "desktop-home");
+    this.isWritableDir = options.isWritableDir ?? isWritableDir;
   }
 
   // ── Viewer slot ────────────────────────────────────────────────────
@@ -747,8 +759,25 @@ export class DesktopSessionManager {
         env[key] = value;
       }
     }
+    if (!env.HOME || !this.isWritableDir(env.HOME)) {
+      try {
+        mkdirSync(this.fallbackHomeDir, { recursive: true });
+        env.HOME = this.fallbackHomeDir;
+      } catch (err) {
+        log.warn({ err }, "Desktop fallback home could not be created");
+      }
+    }
     env.DISPLAY = DESKTOP_DISPLAY;
     return env;
+  }
+}
+
+function isWritableDir(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 

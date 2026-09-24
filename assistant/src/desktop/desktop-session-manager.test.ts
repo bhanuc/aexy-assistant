@@ -700,6 +700,26 @@ describe("the live view's desktop (holds and DevTools)", () => {
     await h.manager.destroy();
   });
 
+  test("a read-only HOME is swapped for a writable one, since Chrome exits without it", async () => {
+    const home = join(profileDir, "fallback-home");
+    const h = newManager({
+      sourceEnv: { HOME: "/root", PATH: "/usr/bin" },
+      isWritableDir: (path) => path !== "/root",
+      fallbackHomeDir: home,
+    });
+    await h.manager.ensureDesktopRunning();
+    await settle();
+    expect(h.child("x-server").request.env.HOME).toBe(home);
+    expect(h.child("browser").request.env.HOME).toBe(home);
+    await h.manager.destroy();
+
+    const writable = newManager({ sourceEnv: { HOME: "/home/me" } });
+    await writable.manager.ensureDesktopRunning();
+    await settle();
+    expect(writable.child("browser").request.env.HOME).toBe("/home/me");
+    await writable.manager.destroy();
+  });
+
   test("releasing a key that was never held changes nothing", async () => {
     const h = newManager();
     const { viewer } = newViewer();
