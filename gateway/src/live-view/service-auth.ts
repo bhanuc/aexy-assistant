@@ -10,7 +10,9 @@
  * - **Managed** (`IS_PLATFORM` + `DISABLE_HTTP_AUTH`): the orchestrator
  *   attests the caller in `X-Vellum-User-Id`, overwriting any client copy,
  *   and the gateway compares it to the stored `platform_user_id`, as
- *   `requireEdgeGuardianAuth` does under the platform bypass.
+ *   `requireEdgeGuardianAuth` does under the platform bypass. A user who is
+ *   not the guardian but is on the pushed access list (C6) is named as that
+ *   entry; each route decides what an entry may do.
  * - **Everywhere else**: the guardian's own actor edge JWT. There is no
  *   control plane in front of a self-hosted assistant; its guardian is the
  *   only party who could be asking.
@@ -31,13 +33,16 @@ import {
 } from "../http/routes/guardian-pin.js";
 import { isHttpAuthDisabled } from "../http/middleware/auth.js";
 import { readStoredPlatformUserId } from "../platform-user-id.js";
+import { findAccessEntry, type AccessEntry } from "./access-store.js";
 import { requestHasVelayBridgeAuth } from "../velay/bridge-auth.js";
 import { VELAY_FORWARDED_HEADER } from "../velay/bridge-utils.js";
 
 const PLATFORM_USER_HEADER = "x-vellum-user-id";
 
 /** The caller a live-view service request was authenticated as. */
-export type LiveServiceCaller = { kind: "guardian" };
+export type LiveServiceCaller =
+  | { kind: "guardian" }
+  | { kind: "entry"; entry: AccessEntry };
 
 export type LiveServiceAuth =
   | { ok: true; caller: LiveServiceCaller }
@@ -96,7 +101,11 @@ export async function authorizeLiveServiceCall(
     if (stored && stored === userId) {
       return { ok: true, caller: { kind: "guardian" } };
     }
-    log.warn({ path }, "live service: attested user is not the guardian");
+    const entry = findAccessEntry(userId);
+    if (entry) {
+      return { ok: true, caller: { kind: "entry", entry } };
+    }
+    log.warn({ path }, "live service: attested user is not on the access list");
     return deny(403);
   }
 

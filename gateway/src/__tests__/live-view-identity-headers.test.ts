@@ -33,6 +33,10 @@ const SPOOFED: Record<string, string> = {
   "x-vellum-live-session-id": "forged",
   "x-vellum-aexy-developer-id": "forged",
   "x-vellum-display-name": "Owner",
+  "x-vellum-acting-user-id": "someone-else",
+  "x-vellum-acting-user-name": "Owner",
+  "x-vellum-acting-user-role": "owner",
+  "x-vellum-acting-aexy-developer-id": "forged",
 };
 
 /**

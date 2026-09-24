@@ -20,6 +20,19 @@ export const DAEMON_VIEWER_HEADERS = {
 } as const;
 
 /**
+ * Headers the gateway sets on a chat request it forwards for someone on the
+ * access list who is not the guardian (C6). Absent on the guardian's own.
+ */
+export const DAEMON_ACTING_USER_HEADERS = {
+  /** Platform `users.id`, the same id as `x-vellum-viewer-id`. */
+  userId: "x-vellum-acting-user-id",
+  /** URL-encoded UTF-8, like `x-velay-display-name`. */
+  userName: "x-vellum-acting-user-name",
+  userRole: "x-vellum-acting-user-role",
+  aexyDeveloperId: "x-vellum-acting-aexy-developer-id",
+} as const;
+
+/**
  * Every live-view identity header the daemon may read. Stripped from client
  * requests by the runtime proxies, so only the gateway itself can set one.
  *
@@ -28,9 +41,10 @@ export const DAEMON_VIEWER_HEADERS = {
  * The live watch stream sets its own copy on a socket the gateway dials fresh,
  * so no client value can reach the daemon alongside it.
  */
-export const DAEMON_IDENTITY_HEADER_NAMES: readonly string[] = Object.freeze(
-  Object.values(DAEMON_VIEWER_HEADERS),
-);
+export const DAEMON_IDENTITY_HEADER_NAMES: readonly string[] = Object.freeze([
+  ...Object.values(DAEMON_VIEWER_HEADERS),
+  ...Object.values(DAEMON_ACTING_USER_HEADERS),
+]);
 
 /** Remove every live-view identity header from `headers`, in place. */
 export function stripLiveViewIdentityHeaders(headers: Headers): Headers {

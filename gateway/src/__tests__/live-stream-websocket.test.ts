@@ -1,4 +1,11 @@
 import { afterEach, beforeEach, describe, test, expect, mock } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  clearLiveAccessStoreCache,
+  recordConversationOwner,
+} from "../live-view/access-store.js";
 import { setVelayBridgeAuthHeader } from "../velay/bridge-auth.js";
 import type { LiveStreamSocketData } from "../http/routes/live-stream-websocket.js";
 import {
@@ -92,12 +99,20 @@ async function open(
   return { res, server };
 }
 
+let securityDir: string;
+
 beforeEach(() => {
   liveViewEnabled = true;
+  securityDir = mkdtempSync(join(tmpdir(), "live-stream-test-"));
+  process.env.GATEWAY_SECURITY_DIR = securityDir;
+  clearLiveAccessStoreCache();
 });
 
 afterEach(() => {
   delete process.env.IS_PLATFORM;
+  delete process.env.GATEWAY_SECURITY_DIR;
+  clearLiveAccessStoreCache();
+  rmSync(securityDir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -154,7 +169,11 @@ describe("live watch stream upgrade", () => {
     );
   });
 
-  test("carries the token's conversation for a chat-scope viewer", async () => {
+  test("carries the token's conversation for a chat-scope viewer who started it", async () => {
+    recordConversationOwner("conv-7", {
+      platformUserId: VIEWER_ID,
+      aexyDeveloperId: "44444444-4444-4444-4444-444444444444",
+    });
     const { server } = await open(
       watch(),
       "/v1/watch/stream",
@@ -168,6 +187,59 @@ describe("live watch stream upgrade", () => {
       upgradedData<LiveStreamSocketData>(server).attestation?.conversationId,
     ).toBe("conv-7");
   });
+
+  /** C6: nobody reads another person's thread through the pod... */
+  test.each([
+    ["someone else's", "55555555-5555-5555-5555-555555555555"],
+    ["the guardian's (unrecorded)", null],
+  ])(
+    "refuses a member chat stream on %s conversation, with 4003",
+    async (_label, owner) => {
+      if (owner) {
+        recordConversationOwner("conv-9", {
+          platformUserId: owner,
+          aexyDeveloperId: "dev-other",
+        });
+      }
+      const { server } = await open(
+        watch(),
+        "/v1/watch/stream",
+        attestedHeaders({
+          "x-velay-stream-scope": "chat",
+          "x-velay-conversation-id": "conv-9",
+        }),
+      );
+
+      expect(upgradedData<LiveStreamSocketData>(server).refusal).toEqual({
+        code: 4003,
+        reason: "Not your conversation",
+      });
+    },
+  );
+
+  /** ...except an owner, manager or admin, through the threads index. */
+  test.each(["owner", "manager", "admin"])(
+    "admits a %s chat stream on someone else's conversation",
+    async (role) => {
+      recordConversationOwner("conv-9", {
+        platformUserId: "55555555-5555-5555-5555-555555555555",
+        aexyDeveloperId: "dev-other",
+      });
+      const { server } = await open(
+        watch(),
+        "/v1/watch/stream",
+        attestedHeaders({
+          "x-velay-stream-scope": "chat",
+          "x-velay-viewer-role": role,
+          "x-velay-conversation-id": "conv-9",
+        }),
+      );
+
+      expect(
+        upgradedData<LiveStreamSocketData>(server).attestation?.conversationId,
+      ).toBe("conv-9");
+    },
+  );
 
   /** C1.1: a chat token always names its conversation. */
   test("refuses a chat scope with no conversation, with 4003", async () => {

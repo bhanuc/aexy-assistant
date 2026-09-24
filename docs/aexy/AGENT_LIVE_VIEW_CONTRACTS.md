@@ -293,6 +293,48 @@ conversation to another except to `owner|manager|admin` via the threads index.
 The daemon prefixes each such turn's context with
 `You are talking with {display_name} ({role}).`
 
+**Gateway side, exactly** (all behind the fork flag `aexy-live-view`; off, these
+paths fall through to the runtime proxy as upstream):
+
+- *Service-authenticated* (`PUT /v1/live/access-list`, `POST /v1/live/control`,
+  `GET /v1/watch/snapshot`, `GET /v1/live/threads`, `POST /v1/live/chat/messages`)
+  means: on a managed pod, the orchestrator's `x-vellum-user-id` is either the
+  stored `platform_user_id` (the guardian) or the `platform_user_id` of an entry
+  on this list; elsewhere, the guardian's own actor edge JWT. Anything relayed
+  by velay is refused. Until WS-12 [P] passes the acting user through, the
+  orchestrator sends the owner and every call acts as the guardian.
+- `PUT /v1/live/access-list` — from the guardian or an `owner|manager|admin`
+  entry. Replaces the list; `200 {"ok":true,"entries":n}`; `400` on a bad entry
+  or a `platform_user_id` listed twice. Stored in the gateway security dir
+  (`aexy-live-access.json`), which the daemon cannot read.
+- `POST /v1/live/chat/messages` `{conversation_id?, text}` → `{conversation_id}`
+  (the C5 chat relay, unchanged). From the guardian or a `can_chat` entry
+  (`403 {code:"chat_not_allowed"}` otherwise). A conversation belongs to the
+  entry that started it here; one nobody on the list started is the
+  guardian's. Posting to anyone else's → `403 {code:"not_your_conversation"}`.
+  Delivered as the daemon's `POST /v1/messages`
+  (`{conversationId?, content, sourceChannel:"vellum", interface:"vellum"}`) on
+  the guardian's actor principal — the only actor the daemon knows — plus, for
+  an entry, the acting-user headers below. Daemon errors pass back verbatim.
+- `GET /v1/live/threads?user=all|<aexy_developer_id>` — the guardian and
+  `owner|manager|admin` entries as asked; a `member` entry always gets
+  `user=<their own aexy_developer_id>` (asking for `all` or someone else → 403).
+- A `scope=chat` watch stream (C1.4) by a `member` viewer is closed 4003 unless
+  the token's conversation is one that viewer started.
+
+**Acting-user headers** (gateway → daemon, only for an entry that is not the
+guardian; stripped from every client request, like the C1.4 viewer headers):
+
+| Header | Value |
+| --- | --- |
+| `x-vellum-acting-user-id` | the entry's `platform_user_id` (same id space as `x-vellum-viewer-id`) |
+| `x-vellum-acting-user-name` | `display_name`, URL-encoded UTF-8 (like `x-velay-display-name`) |
+| `x-vellum-acting-user-role` | `owner \| manager \| admin \| member` |
+| `x-vellum-acting-aexy-developer-id` | the entry's `aexy_developer_id` (what the threads index is keyed by) |
+
+A request carrying these arrives on the guardian's principal; the daemon must
+treat it as that person, not as the guardian.
+
 ---
 
 ## C7. Saved sign-ins — [V] pod → [P] (pod credential)
@@ -301,7 +343,7 @@ The daemon prefixes each such turn's context with
 POST /v1/pod/signins
 Authorization: Bearer <assistant api key>
 {"domain":"venues.com","username":"ops@acme.com",
- "password":"… | null","cookies":[ CDP Network.Cookie … ] | null,
+ "password": <string | null>,"cookies":[ CDP Network.Cookie … ] | null,
  "saved_by_aexy_developer_id":"uuid","intervention_id":"uuid"}
 → 201 {"saved":["login","session"]}
 ```

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, test, expect, mock } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { verifyToken } from "../auth/token-service.js";
 import { AuthRateLimiter } from "../auth-rate-limiter.js";
 import { createRouter } from "../http/router.js";
@@ -59,6 +62,12 @@ mock.module("../fetch.js", () => ({
 }));
 
 const { createLiveViewRoutes } = await import("../http/routes/live-routes.js");
+const {
+  clearLiveAccessStoreCache,
+  conversationOwner,
+  getLiveAccessStorePath,
+  recordConversationOwner,
+} = await import("../live-view/access-store.js");
 
 const fallthrough = mock(async (_req: Request) =>
   Response.json({ source: "runtime-proxy" }, { status: 418 }),
@@ -87,7 +96,12 @@ function managedMode() {
   process.env.DISABLE_HTTP_AUTH = "true";
 }
 
+let securityDir: string;
+
 beforeEach(() => {
+  securityDir = mkdtempSync(join(tmpdir(), "live-routes-test-"));
+  process.env.GATEWAY_SECURITY_DIR = securityDir;
+  clearLiveAccessStoreCache();
   liveViewEnabled = true;
   daemonCalls = [];
   daemonReply = () => Response.json({ ok: true });
@@ -98,6 +112,9 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.IS_PLATFORM;
   delete process.env.DISABLE_HTTP_AUTH;
+  delete process.env.GATEWAY_SECURITY_DIR;
+  clearLiveAccessStoreCache();
+  rmSync(securityDir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -379,6 +396,8 @@ describe("with aexy-live-view off", () => {
     ["POST", "/v1/live/control"],
     ["GET", "/v1/watch/snapshot"],
     ["GET", "/v1/live/threads"],
+    ["PUT", "/v1/live/access-list"],
+    ["POST", "/v1/live/chat/messages"],
   ])(
     "%s %s goes to the runtime-proxy catch-all, as upstream",
     async (method, path) => {
@@ -386,7 +405,7 @@ describe("with aexy-live-view off", () => {
       managedMode();
 
       const res = await route(
-        managed(path, { method, body: method === "POST" ? "{}" : undefined }),
+        managed(path, { method, body: method === "GET" ? undefined : "{}" }),
       );
 
       expect(res!.status).toBe(418);
@@ -394,4 +413,345 @@ describe("with aexy-live-view off", () => {
       expect(daemonCalls).toHaveLength(0);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// C6: the access list, and chat for everyone on it
+// ---------------------------------------------------------------------------
+
+const PRIYA = {
+  platform_user_id: "user-priya",
+  aexy_developer_id: "dev-priya",
+  display_name: "Priya Shāh",
+  role: "member",
+  can_chat: true,
+};
+const ARJUN = {
+  platform_user_id: "user-arjun",
+  aexy_developer_id: "dev-arjun",
+  display_name: "Arjun Mehta",
+  role: "manager",
+  can_chat: true,
+};
+const WATCHER = {
+  platform_user_id: "user-watcher",
+  aexy_developer_id: "dev-watcher",
+  display_name: "Wen",
+  role: "member",
+  can_chat: false,
+};
+
+async function putAccessList(
+  entries: unknown[],
+  userId: string = VELAY_USER_ID,
+): Promise<Response> {
+  return (await route(
+    managed("/v1/live/access-list", {
+      method: "PUT",
+      body: JSON.stringify({ entries }),
+      userId,
+    }),
+  ))!;
+}
+
+function chat(
+  body: Record<string, unknown>,
+  userId: string = VELAY_USER_ID,
+): Promise<Response | null> {
+  return route(
+    managed("/v1/live/chat/messages", {
+      method: "POST",
+      body: JSON.stringify(body),
+      userId,
+    }),
+  );
+}
+
+describe("PUT /v1/live/access-list", () => {
+  beforeEach(managedMode);
+
+  test("stores the list the guardian pushes, 0600 in the security dir", async () => {
+    const res = await putAccessList([PRIYA, ARJUN]);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, entries: 2 });
+    const path = getLiveAccessStorePath();
+    expect(path.startsWith(securityDir)).toBe(true);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    const stored = JSON.parse(readFileSync(path, "utf-8"));
+    expect(stored.entries).toEqual([
+      {
+        platformUserId: "user-priya",
+        aexyDeveloperId: "dev-priya",
+        displayName: "Priya Shāh",
+        role: "member",
+        canChat: true,
+      },
+      {
+        platformUserId: "user-arjun",
+        aexyDeveloperId: "dev-arjun",
+        displayName: "Arjun Mehta",
+        role: "manager",
+        canChat: true,
+      },
+    ]);
+    expect(daemonCalls).toHaveLength(0);
+  });
+
+  test("replaces the whole list, and survives a restart", async () => {
+    await putAccessList([PRIYA, ARJUN]);
+    await putAccessList([ARJUN]);
+    clearLiveAccessStoreCache();
+
+    const res = await chat({ text: "hi" }, "user-priya");
+
+    expect(res!.status).toBe(403);
+  });
+
+  test("accepts a list from a manager already on it", async () => {
+    await putAccessList([ARJUN]);
+
+    const res = await putAccessList([ARJUN, PRIYA], "user-arjun");
+
+    expect(res.status).toBe(200);
+  });
+
+  test("refuses a list from a member on it", async () => {
+    await putAccessList([PRIYA]);
+
+    const res = await putAccessList(
+      [{ ...PRIYA, role: "owner" }],
+      "user-priya",
+    );
+
+    expect(res.status).toBe(403);
+  });
+
+  test("refuses a list from someone not on it", async () => {
+    const res = await putAccessList([PRIYA], "user-stranger");
+
+    expect(res.status).toBe(403);
+  });
+
+  test.each([
+    ["an unknown role", [{ ...PRIYA, role: "superuser" }]],
+    ["a missing can_chat", [{ ...PRIYA, can_chat: undefined }]],
+    ["a blank platform user", [{ ...PRIYA, platform_user_id: " " }]],
+    ["the same user twice", [PRIYA, { ...PRIYA, role: "admin" }]],
+  ])("refuses %s with 400", async (_label, entries) => {
+    const res = await putAccessList(entries);
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /v1/live/chat/messages", () => {
+  beforeEach(async () => {
+    managedMode();
+    await putAccessList([PRIYA, ARJUN, WATCHER]);
+    daemonReply = () =>
+      Response.json(
+        { accepted: true, conversationId: "conv-new", messageId: "m1" },
+        { status: 202 },
+      );
+  });
+
+  test("sends the guardian's message as the guardian, with no acting headers", async () => {
+    const res = await chat({ text: "Book the venue" });
+
+    expect(res!.status).toBe(202);
+    expect(await res!.json()).toEqual({ conversation_id: "conv-new" });
+    const call = daemonCalls[0]!;
+    expect(call.url.pathname).toBe("/v1/messages");
+    expect(JSON.parse(call.body!)).toEqual({
+      content: "Book the venue",
+      sourceChannel: "vellum",
+      interface: "vellum",
+    });
+    expect(call.headers.has("x-vellum-acting-user-id")).toBe(false);
+    const auth = call.headers.get("authorization")!;
+    const claims = verifyToken(auth.slice(7), "vellum-daemon");
+    expect(claims.ok && claims.claims.sub).toBe(
+      `actor:self:${GUARDIAN_PRINCIPAL}`,
+    );
+    expect(conversationOwner("conv-new")).toBeUndefined();
+  });
+
+  test("sends a can_chat member's message naming them, and keys the new conversation to them", async () => {
+    const res = await chat({ text: "What's left on the list?" }, "user-priya");
+
+    expect(res!.status).toBe(202);
+    expect(await res!.json()).toEqual({ conversation_id: "conv-new" });
+    const headers = daemonCalls[0]!.headers;
+    expect(headers.get("x-vellum-acting-user-id")).toBe("user-priya");
+    expect(headers.get("x-vellum-acting-user-name")).toBe(
+      encodeURIComponent("Priya Shāh"),
+    );
+    expect(headers.get("x-vellum-acting-user-role")).toBe("member");
+    expect(headers.get("x-vellum-acting-aexy-developer-id")).toBe("dev-priya");
+    expect(conversationOwner("conv-new")).toEqual({
+      platformUserId: "user-priya",
+      aexyDeveloperId: "dev-priya",
+    });
+  });
+
+  test("lets a member continue their own conversation", async () => {
+    recordConversationOwner("conv-p", {
+      platformUserId: "user-priya",
+      aexyDeveloperId: "dev-priya",
+    });
+    daemonReply = () =>
+      Response.json(
+        { accepted: true, conversationId: "conv-p" },
+        { status: 202 },
+      );
+
+    const res = await chat(
+      { conversation_id: "conv-p", text: "And the caterer?" },
+      "user-priya",
+    );
+
+    expect(res!.status).toBe(202);
+    expect(JSON.parse(daemonCalls[0]!.body!).conversationId).toBe("conv-p");
+  });
+
+  test.each([
+    ["another member's", "user-priya", "user-arjun"],
+    ["the guardian's", null, "user-priya"],
+    ["a member's, as the guardian", "user-priya", VELAY_USER_ID],
+  ])("refuses a post to %s conversation", async (_label, owner, caller) => {
+    if (owner) {
+      recordConversationOwner("conv-x", {
+        platformUserId: owner,
+        aexyDeveloperId: "dev-x",
+      });
+    }
+
+    const res = await chat({ conversation_id: "conv-x", text: "hi" }, caller);
+
+    expect(res!.status).toBe(403);
+    expect((await res!.json()).code).toBe("not_your_conversation");
+    expect(daemonCalls).toHaveLength(0);
+  });
+
+  test("refuses someone on the list without can_chat", async () => {
+    const res = await chat({ text: "hi" }, "user-watcher");
+
+    expect(res!.status).toBe(403);
+    expect((await res!.json()).code).toBe("chat_not_allowed");
+  });
+
+  test("refuses someone not on the list", async () => {
+    const res = await chat({ text: "hi" }, "user-stranger");
+
+    expect(res!.status).toBe(403);
+  });
+
+  test("strips a client's own acting headers", async () => {
+    await route(
+      managed("/v1/live/chat/messages", {
+        method: "POST",
+        body: JSON.stringify({ text: "hi" }),
+        headers: { "x-vellum-acting-user-role": "owner" },
+        userId: "user-priya",
+      }),
+    );
+
+    expect(daemonCalls[0]!.headers.get("x-vellum-acting-user-role")).toBe(
+      "member",
+    );
+  });
+
+  test.each([
+    ["no text", {}],
+    ["blank text", { text: "   " }],
+    ["a non-string conversation", { text: "hi", conversation_id: 7 }],
+  ])("refuses %s with 400", async (_label, body) => {
+    const res = await chat(body);
+
+    expect(res!.status).toBe(400);
+  });
+
+  test("passes a daemon refusal through and records nothing", async () => {
+    daemonReply = () =>
+      Response.json({ error: { code: "BAD_REQUEST" } }, { status: 400 });
+
+    const res = await chat({ text: "hi" }, "user-priya");
+
+    expect(res!.status).toBe(400);
+    expect(conversationOwner("conv-new")).toBeUndefined();
+  });
+
+  test("answers 502 when the daemon names no conversation", async () => {
+    daemonReply = () => Response.json({ accepted: true }, { status: 202 });
+
+    const res = await chat({ text: "hi" }, "user-priya");
+
+    expect(res!.status).toBe(502);
+  });
+});
+
+describe("GET /v1/live/threads for people on the access list", () => {
+  beforeEach(async () => {
+    managedMode();
+    await putAccessList([PRIYA, ARJUN]);
+    daemonReply = () => Response.json([]);
+  });
+
+  test("gives a member only their own threads", async () => {
+    const res = await route(
+      managed("/v1/live/threads", { userId: "user-priya" }),
+    );
+
+    expect(res!.status).toBe(200);
+    const call = daemonCalls[0]!;
+    expect(call.url.searchParams.get("user")).toBe("dev-priya");
+    expect(call.headers.get("x-vellum-acting-user-id")).toBe("user-priya");
+  });
+
+  test.each(["all", "dev-arjun"])(
+    "refuses a member asking for user=%s",
+    async (user) => {
+      const res = await route(
+        managed(`/v1/live/threads?user=${user}`, { userId: "user-priya" }),
+      );
+
+      expect(res!.status).toBe(403);
+      expect(daemonCalls).toHaveLength(0);
+    },
+  );
+
+  test("gives a manager everyone's", async () => {
+    const res = await route(
+      managed("/v1/live/threads?user=all", { userId: "user-arjun" }),
+    );
+
+    expect(res!.status).toBe(200);
+    expect(daemonCalls[0]!.url.searchParams.get("user")).toBe("all");
+    expect(daemonCalls[0]!.headers.get("x-vellum-acting-user-role")).toBe(
+      "manager",
+    );
+  });
+});
+
+describe("control and snapshot for people on the access list", () => {
+  test("relay for anyone on the list, since Aexy authorized the actor", async () => {
+    managedMode();
+    await putAccessList([PRIYA]);
+
+    const control = await route(
+      managed("/v1/live/control", {
+        method: "POST",
+        body: '{"command":"pause"}',
+        userId: "user-priya",
+      }),
+    );
+    const snapshot = await route(
+      managed("/v1/watch/snapshot", { userId: "user-priya" }),
+    );
+
+    expect(control!.status).toBe(200);
+    expect(snapshot!.status).toBe(200);
+    expect(daemonCalls).toHaveLength(2);
+  });
 });

@@ -27,6 +27,14 @@ import type { GatewayConfig } from "../config.js";
 import { requestHasVelayBridgeAuth } from "../velay/bridge-auth.js";
 import { DAEMON_VIEWER_HEADERS } from "./identity-headers.js";
 import { isLiveViewEnabled } from "./flag.js";
+import { conversationOwner } from "./access-store.js";
+import {
+  isPrivilegedRole,
+  STREAM_SCOPES,
+  VIEWER_ROLES,
+  type StreamScope,
+  type ViewerRole,
+} from "./roles.js";
 
 /** Headers the tunnel injects on a relayed live stream (contract C1.3). */
 export const VELAY_STREAM_HEADERS = {
@@ -37,12 +45,6 @@ export const VELAY_STREAM_HEADERS = {
   displayName: "x-velay-display-name",
   conversationId: "x-velay-conversation-id",
 } as const;
-
-export const STREAM_SCOPES = ["watch", "control", "chat"] as const;
-export type StreamScope = (typeof STREAM_SCOPES)[number];
-
-export const VIEWER_ROLES = ["owner", "manager", "admin", "member"] as const;
-export type ViewerRole = (typeof VIEWER_ROLES)[number];
 
 /** Close code for a live stream the attestation does not admit. */
 export const LIVE_STREAM_FORBIDDEN = 4003;
@@ -170,6 +172,17 @@ export function authorizeLiveStream(
   if (scope === "chat" && !conversationId) {
     log.warn({ path }, "live stream: chat scope without a conversation");
     return refuse("Chat scope needs a conversation");
+  }
+  if (
+    scope === "chat" &&
+    conversationId &&
+    !isPrivilegedRole(viewerRole) &&
+    conversationOwner(conversationId)?.platformUserId !== base.userId
+  ) {
+    // C6: a member reads only a conversation they started. Owners, managers
+    // and admins reach others' through the threads index, which Aexy logs.
+    log.warn({ path }, "live stream: chat on someone else's conversation");
+    return refuse("Not your conversation");
   }
 
   const attestation: LiveStreamAttestation = {
