@@ -101,6 +101,42 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Aexy live view (fork, plan WS-0): the assistant desktop's packages and its
+# pinned, checksum-verified Google Chrome, baked into the image so neither the
+# first viewer nor the agent's first browser call waits minutes on apt (and so
+# a read-only /app never matters). Mirrors desktop-dependencies.ts —
+# DESKTOP_PACKAGES, CHROME_VERSION and CHROME_PACKAGES — whose readiness check
+# then finds everything present and skips its runtime install. Chrome lands in
+# /opt/vellum-desktop, which desktopChromePath() prefers once `.ready` exists.
+# Build with --build-arg VELLUM_BAKE_DESKTOP=false for upstream's lean image.
+ARG VELLUM_BAKE_DESKTOP=true
+ARG TARGETARCH
+ARG VELLUM_DESKTOP_CHROME_VERSION=153.0.8010.36-1
+RUN if [ "$VELLUM_BAKE_DESKTOP" = "true" ]; then \
+      set -eu; \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        dbus-x11 feh gnome-mines openbox tigervnc-standalone-server \
+        tigervnc-common plank bamfdaemon dbus-daemon xauth xcompmgr \
+        xfonts-base xterm fonts-liberation libgtk-3-0 libvulkan1 libcurl4; \
+      rm -rf /var/lib/apt/lists/*; \
+      arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+      case "$arch" in \
+        amd64) sha=9bb44e33031c2f2857cf36b4343051a12f93058e4b781e3c76313df87f6c8d32 ;; \
+        arm64) sha=1fcf6ec51a9d52e26ff1ad807225f725be55069ad2b68c5d69361a2746665188 ;; \
+        *) echo "no pinned Chrome for $arch" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSL --proto '=https' --retry 2 --max-time 300 -o /tmp/chrome.deb \
+        "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${VELLUM_DESKTOP_CHROME_VERSION}_${arch}.deb"; \
+      echo "$sha  /tmp/chrome.deb" | sha256sum -c -; \
+      root="/opt/vellum-desktop/chrome-${VELLUM_DESKTOP_CHROME_VERSION}"; \
+      mkdir -p "$root"; \
+      dpkg-deb --extract /tmp/chrome.deb "$root"; \
+      rm -f /tmp/chrome.deb; \
+      "$root/opt/google/chrome/chrome" --version; \
+      touch "$root/opt/google/chrome/chrome.ready"; \
+    fi
+
 # Copy bun binary from builder instead of re-installing
 COPY --from=builder /root/.bun/bin/bun /usr/local/bin/bun
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx

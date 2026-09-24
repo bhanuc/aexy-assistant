@@ -625,3 +625,90 @@ describe("DesktopSessionManager viewer slot", () => {
     expect(h.count("x-server")).toBe(1);
   });
 });
+
+describe("the live view's desktop (holds and DevTools)", () => {
+  test("Chrome opens a loopback DevTools port only when one is asked for", async () => {
+    const plain = newManager();
+    await plain.manager.ensureDesktopRunning();
+    await settle();
+    expect(
+      plain
+        .child("browser")
+        .request.cmd.some((arg) => arg.startsWith("--remote-debugging")),
+    ).toBe(false);
+    await plain.manager.destroy();
+
+    const live = newManager({ remoteDebuggingPort: 9222 });
+    await live.manager.ensureDesktopRunning();
+    await settle();
+    const cmd = live.child("browser").request.cmd;
+    expect(cmd).toContain("--remote-debugging-port=9222");
+    expect(cmd).toContain("--remote-debugging-address=127.0.0.1");
+    // A custom profile, which Chrome requires before it opens the port.
+    expect(cmd).toContain(`--user-data-dir=${profileDir}`);
+    await live.manager.destroy();
+  });
+
+  test("a hold keeps the tree after the last viewer leaves; releasing it starts the linger", async () => {
+    const h = newManager();
+    const { viewer } = newViewer();
+    h.manager.acquireViewerSlot(viewer);
+    await h.manager.ensureDesktopRunning();
+    await settle();
+
+    h.manager.hold("workspace-task:claim-1");
+    h.manager.releaseViewerSlot(viewer);
+    await sleep(LINGER_MS * 2);
+    expect(h.killed).toEqual([]);
+    expect(h.manager.getState()).toBe("ready");
+
+    h.manager.release("workspace-task:claim-1");
+    await sleep(LINGER_MS * 2);
+    expect(h.terminated()).toHaveLength(6);
+    expect(h.manager.getState()).toBe("off");
+  });
+
+  test("a tree started with no viewer and no hold lingers once touched", async () => {
+    const h = newManager();
+    await h.manager.ensureDesktopRunning();
+    await settle();
+    h.manager.touch();
+    await sleep(LINGER_MS * 2);
+    expect(h.terminated()).toHaveLength(6);
+  });
+
+  test("touching a held tree does not start the linger", async () => {
+    const h = newManager();
+    h.manager.hold("agent");
+    await h.manager.ensureDesktopRunning();
+    await settle();
+    h.manager.touch();
+    await sleep(LINGER_MS * 2);
+    expect(h.killed).toEqual([]);
+    await h.manager.destroy();
+  });
+
+  test("a browser exit under a hold relaunches it, since the agent is using it", async () => {
+    const h = newManager();
+    h.manager.hold("workspace-task:claim-1");
+    await h.manager.ensureDesktopRunning();
+    await settle();
+
+    h.child("browser").exit(1);
+    await settle();
+    expect(h.count("browser")).toBe(2);
+    await h.manager.destroy();
+  });
+
+  test("releasing a key that was never held changes nothing", async () => {
+    const h = newManager();
+    const { viewer } = newViewer();
+    h.manager.acquireViewerSlot(viewer);
+    await h.manager.ensureDesktopRunning();
+    await settle();
+    h.manager.release("never-held");
+    await sleep(LINGER_MS * 2);
+    expect(h.killed).toEqual([]);
+    await h.manager.destroy();
+  });
+});

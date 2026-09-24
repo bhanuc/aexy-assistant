@@ -30,6 +30,8 @@
  * browser step cannot be relied on to call it.
  */
 
+import { holdDesktopForClaim } from "../live/desktop-browser.js";
+import { isLiveViewEnabled } from "../live/live-view-feature.js";
 import { runBackgroundJob } from "../runtime/background-job-runner.js";
 import { wrapUntrustedContent } from "../security/untrusted-content.js";
 import { getLogger } from "../util/logger.js";
@@ -117,6 +119,12 @@ async function workClaimedTask(
   const active: ActiveTask = { task, claim, settled: null };
   setActiveTask(active);
   const stopHeartbeat = startHeartbeat(claim, signal);
+  // Under the live view the desktop the agent browses on stays up for the
+  // whole claim, not just the linger after its last browser call, so the page
+  // it left is still there for whoever opens the watch view mid-task.
+  const releaseDesktop = isLiveViewEnabled()
+    ? holdDesktopForClaim(claim.id)
+    : () => {};
 
   try {
     const timeoutMs = turnBudgetMs(claim);
@@ -175,6 +183,7 @@ async function workClaimedTask(
     return { ran: true, taskId: task.id, settled: "released" };
   } finally {
     stopHeartbeat();
+    releaseDesktop();
     setActiveTask(null);
   }
 }

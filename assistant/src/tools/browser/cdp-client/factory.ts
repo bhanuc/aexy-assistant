@@ -10,6 +10,12 @@ import {
 } from "../../../browser-session/index.js";
 import { getConfig } from "../../../config/loader.js";
 import { HostBrowserProxy } from "../../../daemon/host-browser-proxy.js";
+import { ensureDesktopBrowserForAgent } from "../../../live/desktop-browser.js";
+import {
+  DESKTOP_CDP_HOST,
+  DESKTOP_CDP_PORT,
+  isLiveViewEnabled,
+} from "../../../live/live-view-feature.js";
 import { getLogger } from "../../../util/logger.js";
 import type { ToolContext } from "../../types.js";
 import { getPinnedTab } from "../pinned-tabs.js";
@@ -333,6 +339,13 @@ export function buildPinnedCandidateList(
       ];
     }
     case "cdp-inspect": {
+      // Under the live view the only Chrome on this pod's loopback is the
+      // desktop's, and it may not be up yet; the sticky memo lands here too.
+      if (isLiveViewEnabled()) {
+        return [
+          makeLiveDesktopCandidate(conversationId, "pinned mode: cdp-inspect"),
+        ];
+      }
       const cdpInspectConfig = getConfig().hostBrowser.cdpInspect;
       return [
         {
@@ -558,7 +571,17 @@ export function buildCandidateList(
 
   // 2. cdp-inspect -- opt-in via config OR desktop-auto for macOS turns.
   const cdpInspectConfig = getConfig().hostBrowser.cdpInspect;
-  if (cdpInspectConfig.enabled) {
+  if (isLiveViewEnabled()) {
+    // Live view: the agent's browser is the desktop Chrome people can watch
+    // (plan D1). Local stays behind it as the fallback for a desktop that
+    // cannot start, so a broken desktop costs visibility, not the work.
+    candidates.push(
+      makeLiveDesktopCandidate(
+        conversationId,
+        "live view: the desktop Chrome over DevTools",
+      ),
+    );
+  } else if (cdpInspectConfig.enabled) {
     // Explicitly enabled in config -- always include regardless of platform.
     candidates.push({
       kind: "cdp-inspect",
@@ -635,6 +658,52 @@ export function buildCandidateList(
   });
 
   return candidates;
+}
+
+/**
+ * The cdp-inspect candidate for the live view's desktop Chrome. Each send
+ * first makes sure the desktop is up and Chrome answers DevTools; a desktop
+ * that cannot start is reported as a transport failure so auto mode fails
+ * over to the local backend instead of failing the tool call.
+ */
+function makeLiveDesktopCandidate(
+  conversationId: string,
+  reason: string,
+): BackendCandidate {
+  return {
+    kind: "cdp-inspect",
+    reason,
+    create() {
+      const client = createCdpInspectClient(conversationId, {
+        host: DESKTOP_CDP_HOST,
+        port: DESKTOP_CDP_PORT,
+      });
+      const backend = createCdpInspectBackend({
+        isAvailable: () => true,
+        sendCdp: async (command, signal) => {
+          try {
+            await ensureDesktopBrowserForAgent();
+          } catch (err) {
+            const message =
+              err instanceof Error ? err.message : "desktop unavailable";
+            return {
+              error: {
+                code: -1,
+                message,
+                data: new CdpError("transport_error", message, {
+                  cdpMethod: command.method,
+                  underlying: err,
+                }),
+              },
+            };
+          }
+          return dispatchThroughClient(client, command, signal);
+        },
+        dispose: () => client.dispose(),
+      });
+      return { client, backend };
+    },
+  };
 }
 
 /**
