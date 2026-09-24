@@ -16,6 +16,7 @@ import type { TokenClaims } from "../../auth/types.js";
 import type { GatewayConfig } from "../../config.js";
 import { fetchImpl } from "../../fetch.js";
 import { getLogger } from "../../logger.js";
+import { stripLiveViewIdentityHeaders } from "../../live-view/identity-headers.js";
 import { isLoopbackAddress } from "../../util/is-loopback-address.js";
 import { tryIpcProxy } from "./ipc-runtime-proxy.js";
 
@@ -160,6 +161,9 @@ export function createRuntimeProxyHandler(config: GatewayConfig) {
       new Headers(req.headers),
       exchangeToken,
     );
+    // The Aexy live-view identity headers are the gateway's to set, never the
+    // caller's (`live-view/identity-headers.ts`).
+    stripLiveViewIdentityHeaders(reqHeaders);
 
     // Inject the real client IP so the runtime can rate-limit per-user,
     // overwriting any client-supplied value to prevent spoofing.

@@ -60,6 +60,10 @@ import {
   type DesktopStreamSocketData,
 } from "./http/routes/desktop-stream-websocket.js";
 import {
+  getLiveStreamWebsocketHandlers,
+  isLiveStreamSocketData,
+} from "./http/routes/live-stream-websocket.js";
+import {
   createSpeechRelayUpgradeHandler,
   getSpeechRelayWebsocketHandlers,
   type SpeechRelaySocketData,
@@ -617,6 +621,7 @@ async function main() {
   const sttStreamWebsocketHandlers = getSttStreamWebsocketHandlers();
   const watchStreamWebsocketHandlers = getWatchStreamWebsocketHandlers();
   const desktopStreamWebsocketHandlers = getDesktopStreamWebsocketHandlers();
+  const liveStreamWebsocketHandlers = getLiveStreamWebsocketHandlers();
   const liveVoiceWebsocketHandlers = getLiveVoiceWebsocketHandlers();
   const speechRelayWebsocketHandlers = getSpeechRelayWebsocketHandlers();
   const { handler: handleWhatsAppWebhook, dedupCache: whatsappDedupCache } =
@@ -2011,6 +2016,10 @@ async function main() {
           desktopStreamWebsocketHandlers.open(ws as never);
           return;
         }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.open(ws as never);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.open(ws as never);
           return;
@@ -2042,6 +2051,10 @@ async function main() {
           desktopStreamWebsocketHandlers.message(ws as never, message);
           return;
         }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.message(ws as never, message);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.message(ws as never, message);
           return;
@@ -2071,6 +2084,10 @@ async function main() {
         }
         if (isDesktopStreamSocketData(ws.data)) {
           desktopStreamWebsocketHandlers.close(ws as never, code, reason);
+          return;
+        }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.close(ws as never, code, reason);
           return;
         }
         if (isLiveVoiceSocketData(ws.data)) {
