@@ -42,6 +42,14 @@ import type { GatewayConfig } from "../../config.js";
  */
 const MAX_PENDING_MESSAGES = 100;
 
+/**
+ * Bun's client WebSocket takes upgrade headers, which the DOM typing does not
+ * know about; the velay bridge casts the same way.
+ */
+type WebSocketWithHeaders = {
+  new (url: string, options: { headers: Record<string, string> }): WebSocket;
+};
+
 /** Payload size of a frame, so an empty one is not mistaken for a dropped one. */
 function byteLength(frame: string | Uint8Array): number {
   return typeof frame === "string" ? frame.length : frame.byteLength;
@@ -167,6 +175,13 @@ export interface RuntimeAudioStreamHandlerOptions<
   /** Extra fields worth logging alongside every message about this socket. */
   logContext?: (data: T) => Record<string, unknown>;
   /**
+   * Headers set on the upstream dial, built from the socket's own state and
+   * never from anything the client sent. Only the Aexy live streams use it,
+   * to carry the tunnel-attested viewer (`live-view/stream-auth.ts`); every
+   * upstream route dials with the service token alone.
+   */
+  upstreamHeaders?: (data: T) => Record<string, string> | undefined;
+  /**
    * Whether a dropped downstream frame is fatal to the session.
    *
    * Only `/v1/desktop/stream` opts in. RFB is an ordered byte stream with no
@@ -195,6 +210,7 @@ export function createRuntimeAudioStreamHandlers<
   label,
   upstreamParams = () => ({}),
   logContext = () => ({}),
+  upstreamHeaders = () => undefined,
   closeOnDroppedFrame = false,
 }: RuntimeAudioStreamHandlerOptions<T>) {
   return {
@@ -215,7 +231,12 @@ export function createRuntimeAudioStreamHandlers<
         `Opening upstream ${label} WS to runtime`,
       );
 
-      const upstream = new WebSocket(upstreamUrl);
+      const headers = upstreamHeaders(ws.data);
+      const upstream = headers
+        ? new (WebSocket as unknown as WebSocketWithHeaders)(upstreamUrl, {
+            headers,
+          })
+        : new WebSocket(upstreamUrl);
       ws.data.upstream = upstream;
 
       upstream.addEventListener("open", () => {

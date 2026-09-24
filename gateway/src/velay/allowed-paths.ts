@@ -14,10 +14,16 @@
  * performed by the per-route handlers in the gateway runtime, not by Velay.
  *
  *   - `^/v1/watch/stream`: exact match for the browser watch-session
- *     WebSocket, which carries a session's narration audio.
+ *     WebSocket, which carries a session's narration audio. With the Aexy
+ *     fork's `aexy-live-view` flag it also carries the agent live view to
+ *     anyone the tunnel attests a stream scope for.
  *   - `^/v1/desktop/stream`: exact match for the browser assistant-desktop
  *     WebSocket, a raw RFB byte pipe to the pod's VNC server. Guardian-only
- *     at the gateway handler, the same shape as the watch stream.
+ *     at the gateway handler, the same shape as the watch stream, except for
+ *     an attested `control` scope under `aexy-live-view`.
+ *
+ * The live view's service routes (`/v1/live/*`, `/v1/watch/snapshot`) are
+ * deliberately absent: they are reached through the orchestrator proxy only.
  *
  * If you add a new public route to `gateway/src/index.ts` that must be
  * reachable through the Velay tunnel (i.e. anything an external provider

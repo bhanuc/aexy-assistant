@@ -60,6 +60,10 @@ import {
   type DesktopStreamSocketData,
 } from "./http/routes/desktop-stream-websocket.js";
 import {
+  getLiveStreamWebsocketHandlers,
+  isLiveStreamSocketData,
+} from "./http/routes/live-stream-websocket.js";
+import {
   createSpeechRelayUpgradeHandler,
   getSpeechRelayWebsocketHandlers,
   type SpeechRelaySocketData,
@@ -207,7 +211,11 @@ import { createDiscordInboundEventHandler } from "./discord/forward.js";
 import { handleInbound } from "./handlers/handle-inbound.js";
 import { upsertContactChannel } from "./verification/contact-helpers.js";
 import { checkAuthRateLimit } from "./http/middleware/rate-limit.js";
-import { logAuthBypassState } from "./http/middleware/auth.js";
+import {
+  logAuthBypassState,
+  wrapWithAuthFailureTracking,
+} from "./http/middleware/auth.js";
+import { createLiveViewRoutes } from "./http/routes/live-routes.js";
 import {
   resolveExtensionOrigin,
   handleExtensionPreflight,
@@ -617,6 +625,7 @@ async function main() {
   const sttStreamWebsocketHandlers = getSttStreamWebsocketHandlers();
   const watchStreamWebsocketHandlers = getWatchStreamWebsocketHandlers();
   const desktopStreamWebsocketHandlers = getDesktopStreamWebsocketHandlers();
+  const liveStreamWebsocketHandlers = getLiveStreamWebsocketHandlers();
   const liveVoiceWebsocketHandlers = getLiveVoiceWebsocketHandlers();
   const speechRelayWebsocketHandlers = getSpeechRelayWebsocketHandlers();
   const { handler: handleWhatsAppWebhook, dedupCache: whatsappDedupCache } =
@@ -1964,6 +1973,18 @@ async function main() {
     );
   }
 
+  // Aexy live view (`aexy-live-view`): service routes the daemon serves, which
+  // with the flag off fall through to the catch-all below exactly as upstream.
+  routes.push(
+    ...createLiveViewRoutes(config, (req, getClientIp) =>
+      wrapWithAuthFailureTracking(
+        (r) => handleRuntimeProxy(r, getClientIp()),
+        authRateLimiter,
+        getClientIp,
+      )(req),
+    ),
+  );
+
   // Runtime proxy catch-all — must be last so specific routes are checked first.
   routes.push({
     path: /^\//, // match everything
@@ -2011,6 +2032,10 @@ async function main() {
           desktopStreamWebsocketHandlers.open(ws as never);
           return;
         }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.open(ws as never);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.open(ws as never);
           return;
@@ -2042,6 +2067,10 @@ async function main() {
           desktopStreamWebsocketHandlers.message(ws as never, message);
           return;
         }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.message(ws as never, message);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.message(ws as never, message);
           return;
@@ -2071,6 +2100,10 @@ async function main() {
         }
         if (isDesktopStreamSocketData(ws.data)) {
           desktopStreamWebsocketHandlers.close(ws as never, code, reason);
+          return;
+        }
+        if (isLiveStreamSocketData(ws.data)) {
+          liveStreamWebsocketHandlers.close(ws as never, code, reason);
           return;
         }
         if (isLiveVoiceSocketData(ws.data)) {
