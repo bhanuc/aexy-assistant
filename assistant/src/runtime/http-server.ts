@@ -38,6 +38,14 @@ import {
   destroyDesktopSessionManager,
 } from "../desktop/desktop-session-manager.js";
 import { DesktopStreamBridge } from "../desktop/desktop-stream-bridge.js";
+import { isLiveViewEnabled } from "../live/live-view-feature.js";
+import {
+  getLiveWatchHub,
+  parseWatchViewer,
+  WATCH_CLOSE,
+  type WatchConnection,
+  type WatchViewer,
+} from "../live/watch-hub.js";
 import {
   createLiveVoiceConnection,
   type LiveVoiceConnection,
@@ -245,12 +253,26 @@ interface DesktopStreamWebSocketData {
   bridge?: DesktopStreamBridge;
 }
 
+/**
+ * WebSocket data for the Aexy live view's `/v1/watch/stream` (fork, C2). Same
+ * path as upstream's narration capture above; told apart by the gateway's
+ * `x-vellum-stream-scope` header, which only the live view's dial carries.
+ */
+interface LiveWatchWebSocketData {
+  wsType: "live-watch";
+  /** `null` when the attested viewer headers were missing or malformed. */
+  viewer: WatchViewer | null;
+  requestedConversationId: string | null;
+  connection?: WatchConnection;
+}
+
 type AllWebSocketData =
   | MediaStreamWebSocketData
   | SttStreamWebSocketData
   | LiveVoiceWebSocketData
   | WatchStreamWebSocketData
-  | DesktopStreamWebSocketData;
+  | DesktopStreamWebSocketData
+  | LiveWatchWebSocketData;
 
 function assistantDesktopEnabled(): boolean {
   try {
@@ -451,6 +473,26 @@ export class RuntimeHttpServer {
             void session.start();
             return;
           }
+          if (data.wsType === "live-watch") {
+            // Close codes, not HTTP statuses: the gateway relays those.
+            if (!isLiveViewEnabled()) {
+              ws.close(
+                WATCH_CLOSE.disabled,
+                "The live view is not available on this assistant",
+              );
+              return;
+            }
+            if (!data.viewer) {
+              ws.close(WATCH_CLOSE.forbidden, "Viewer not attested");
+              return;
+            }
+            data.connection = getLiveWatchHub().connect(
+              ws,
+              data.viewer,
+              data.requestedConversationId,
+            );
+            return;
+          }
           if (data.wsType === "desktop-stream") {
             log.info("Desktop stream WebSocket opened");
             if (!assistantDesktopEnabled()) {
@@ -519,6 +561,15 @@ export class RuntimeHttpServer {
           }
           if (data.wsType === "desktop-stream") {
             data.bridge?.handleClientFrame(message);
+            return;
+          }
+          if (data.wsType === "live-watch") {
+            if (data.connection) {
+              getLiveWatchHub().handleMessage(
+                data.connection,
+                typeof message === "string" ? message : new Uint8Array(message),
+              );
+            }
             return;
           }
           log.warn("WebSocket message on unknown data type — closing");
@@ -622,10 +673,24 @@ export class RuntimeHttpServer {
             data.bridge?.handleClose();
             return;
           }
+          if (data.wsType === "live-watch") {
+            if (data.connection) {
+              getLiveWatchHub().disconnect(data.connection);
+            }
+            return;
+          }
           log.warn(
             { code, reason: reason?.toString() },
             "WebSocket with unknown data type closed",
           );
+        },
+        drain: (ws) => {
+          const data = ws.data as AllWebSocketData;
+          if (data.wsType === "live-watch" && data.connection) {
+            // Latest-frame-wins: a backed-up viewer gets the newest frame
+            // it skipped once its socket catches up.
+            getLiveWatchHub().handleDrain(data.connection);
+          }
         },
       },
     });
@@ -860,11 +925,15 @@ export class RuntimeHttpServer {
 
     // WebSocket upgrade for watch narration capture, under the same
     // private-network restrictions and gateway-service token verification as
-    // STT streaming.
+    // STT streaming. The Aexy live view shares the path; its gateway dial
+    // carries the attested stream scope, which narration capture never does.
     if (
       path === "/v1/watch/stream" &&
       req.headers.get("upgrade")?.toLowerCase() === "websocket"
     ) {
+      if (req.headers.has("x-vellum-stream-scope")) {
+        return this.handleLiveWatchUpgrade(req, server);
+      }
       return this.handleWatchStreamUpgrade(req, server);
     }
 
@@ -1135,6 +1204,29 @@ export class RuntimeHttpServer {
         sessionId: crypto.randomUUID(),
       } satisfies WatchStreamWebSocketData;
     });
+  }
+
+  /**
+   * Handle the Aexy live view's `/v1/watch/stream` upgrade: the same gate as
+   * every gateway-proxied stream, with the viewer read from the headers the
+   * gateway attested (C1.4). The feature and identity gates run in the open
+   * handler, as close codes 4008 and 4003.
+   */
+  private handleLiveWatchUpgrade(
+    req: Request,
+    server: ReturnType<typeof Bun.serve>,
+  ): Response {
+    return this.upgradeRuntimeStream(
+      req,
+      server,
+      "live watch stream",
+      (query) =>
+        ({
+          wsType: "live-watch",
+          viewer: parseWatchViewer((name) => req.headers.get(name)),
+          requestedConversationId: query.get("conversationId")?.trim() || null,
+        }) satisfies LiveWatchWebSocketData,
+    );
   }
 
   /**

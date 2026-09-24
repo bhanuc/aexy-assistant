@@ -92,6 +92,14 @@ as `x-vellum-viewer-id` (= `x-velay-user-id`), `x-vellum-viewer-role`,
 `x-vellum-conversation-id`, plus the existing gateway service token.
 `/v1/desktop/stream` with scope ≠ `control` → close 4003.
 
+Upstream already serves `/v1/watch/stream` on the daemon (narration capture,
+no viewer headers). The daemon routes an upgrade to the live view **only when
+`x-vellum-stream-scope` is present on the gateway's dial**, so the gateway must
+always send it on this path and must strip every `x-vellum-viewer-*`,
+`x-vellum-stream-scope`, `x-vellum-live-session-id`,
+`x-vellum-aexy-developer-id`, `x-vellum-display-name` and
+`x-vellum-conversation-id` header from client input.
+
 ---
 
 ## C2. Watch stream — `/v1/watch/stream` [V], consumed by [A] frontend
@@ -148,11 +156,16 @@ No control commands on this socket — control goes through Aexy (C4).
 - An open viewer calls the platform's record-activity (throttled to 30 s) so the
   pod isn't slept.
 - On connect a `frame` with the last known frame is sent immediately if any.
+- A viewer whose token names no conversation follows the target order above;
+  when that target changes (a claim's turn starts) it is sent a fresh `hello`
+  carrying the new `conversationId`. `seq` is per socket and monotonic across
+  `event` and `frame` messages.
 
 ### Close codes
 
 `4003` forbidden · `4008` desktop feature disabled · `4010` agent has no browser
-open (socket stays usable for events; this is sent as `error` not close) ·
+open (socket stays usable for events; this is sent as
+`{"type":"error","code":"4010",…}`, not a close) ·
 `4013` (desktop stream only) someone else holds control · `4801` tunnel dropped
 (reconnect with a fresh token).
 
@@ -301,7 +314,7 @@ The daemon prefixes each such turn's context with
 POST /v1/pod/signins
 Authorization: Bearer <assistant api key>
 {"domain":"venues.com","username":"ops@acme.com",
- "password":"… | null","cookies":[ CDP Network.Cookie … ] | null,
+ "password": null | "…", "cookies": null | [ CDP Network.Cookie … ],
  "saved_by_aexy_developer_id":"uuid","intervention_id":"uuid"}
 → 201 {"saved":["login","session"]}
 ```
