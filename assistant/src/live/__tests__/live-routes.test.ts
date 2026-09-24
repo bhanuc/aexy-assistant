@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { ScreencastFrame } from "../../live/screencast.js";
 import {
   _resetWatchSnapshotForTests,
+  handleLiveControlRoute,
   handleWatchSnapshot,
 } from "../../runtime/routes/live-routes.js";
 
@@ -68,5 +69,33 @@ describe("GET /v1/watch/snapshot", () => {
     await expect(handleWatchSnapshot({ enabled: () => false })).rejects.toThrow(
       "not available",
     );
+  });
+});
+
+describe("POST /v1/live/control", () => {
+  test("passes the daemon's status and body back verbatim", async () => {
+    const res = await handleLiveControlRoute(
+      { command: "acquire_control" },
+      {
+        enabled: () => true,
+        handle: async () => ({
+          status: 409,
+          body: { ok: false, code: "control_held", holder: { id: "d" } },
+        }),
+      },
+    );
+    expect(res.status).toBe(409);
+    expect(res.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(String(res.body))).toEqual({
+      ok: false,
+      code: "control_held",
+      holder: { id: "d" },
+    });
+  });
+
+  test("is not found with the live view off", async () => {
+    await expect(
+      handleLiveControlRoute({}, { enabled: () => false }),
+    ).rejects.toThrow("not available");
   });
 });

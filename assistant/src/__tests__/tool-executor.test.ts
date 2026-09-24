@@ -165,6 +165,53 @@ function makePrompter(): PermissionPrompter {
   } as unknown as PermissionPrompter;
 }
 
+describe("ToolExecutor under an Aexy live-view control lease", () => {
+  test("refuses browser and computer-use tools while a person drives, and nothing else", async () => {
+    const { installLiveControl, LiveControl } =
+      await import("../live/live-control.js");
+    const { _resetLiveControlStateForTests } =
+      await import("../live/control-state.js");
+    const control = new LiveControl({
+      deliver: async () => {},
+      abortTurn: () => false,
+      activeTask: () => null,
+      releaseActiveTask: async () => {},
+      resolveTarget: () => "conversation-1",
+      captureScreenshot: async () => null,
+    });
+    installLiveControl(control);
+    try {
+      await control.handle({
+        command: "acquire_control",
+        actor: {
+          aexy_developer_id: "dev-1",
+          display_name: "Priya",
+          role: "member",
+        },
+      });
+      const executor = new ToolExecutor(makePrompter());
+      const refused = await executor.execute(
+        "browser_click",
+        { element_id: "e1" },
+        makeContext(),
+      );
+      expect(refused.isError).toBe(true);
+      expect(refused.content).toContain("A person is driving the browser");
+
+      const allowed = await executor.execute(
+        "file_read",
+        { path: "README.md" },
+        makeContext(),
+      );
+      expect(allowed.content).toBe("ok");
+    } finally {
+      control.dispose();
+      installLiveControl(null);
+      _resetLiveControlStateForTests();
+    }
+  });
+});
+
 describe("ToolExecutor allowedToolNames gating", () => {
   beforeEach(() => {
     fakeToolResult = { content: "ok", isError: false };

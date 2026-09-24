@@ -7,6 +7,7 @@ import type {
 } from "@vellumai/gateway-client";
 
 import { getConfig } from "../config/loader.js";
+import { liveToolRefusal } from "../live/live-control.js";
 import {
   classifyRisk,
   type RiskClassificationWithMeta,
@@ -64,6 +65,15 @@ export class ToolExecutor {
   ): Promise<ToolExecutionResult> {
     const { name: executionName, input: executionInput } =
       resolveToolInvocationAlias(name, input, context.allowedToolNames);
+    // Aexy live view (fork): while a person holds the control lease, the
+    // browser and computer-use tools would fight them for the same screen.
+    const drivingRefusal = liveToolRefusal(
+      executionName,
+      context.conversationId,
+    );
+    if (drivingRefusal) {
+      return { content: drivingRefusal, isError: true };
+    }
     return this.executeInternal(executionName, executionInput, context);
   }
 

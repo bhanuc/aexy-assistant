@@ -38,6 +38,7 @@ import {
   destroyDesktopSessionManager,
 } from "../desktop/desktop-session-manager.js";
 import { DesktopStreamBridge } from "../desktop/desktop-stream-bridge.js";
+import { getLiveControl } from "../live/live-control-runtime.js";
 import { isLiveViewEnabled } from "../live/live-view-feature.js";
 import {
   getLiveWatchHub,
@@ -251,6 +252,14 @@ interface DesktopStreamWebSocketData {
   wsType: "desktop-stream";
   /** Bound at open time so message/close handlers reach this socket's pump. */
   bridge?: DesktopStreamBridge;
+  /**
+   * Aexy live view (fork, C3): the gateway's attested scope and person, when
+   * this dial came from a live session rather than the guardian pin.
+   */
+  liveScope?: string | null;
+  liveDeveloperId?: string | null;
+  /** Set once this socket is the control-lease holder's desktop. */
+  holdsLease?: boolean;
 }
 
 /**
@@ -502,6 +511,30 @@ export class RuntimeHttpServer {
               );
               return;
             }
+            if (isLiveViewEnabled()) {
+              // C3: under the live view only the control-lease holder gets
+              // the desktop, and only on a control-scoped session.
+              const control = getLiveControl();
+              if (data.liveScope && data.liveScope !== "control") {
+                ws.close(WATCH_CLOSE.forbidden, "Driving needs control scope");
+                return;
+              }
+              const leaseHeld = !!control.snapshot.holder;
+              if (
+                (data.liveScope || leaseHeld) &&
+                !control.mayOpenDesktop(data.liveDeveloperId ?? null)
+              ) {
+                ws.close(
+                  DESKTOP_CLOSE.busy,
+                  "Someone else holds control of this desktop",
+                );
+                return;
+              }
+              if (data.liveScope) {
+                data.holdsLease = true;
+                control.noteDesktopSocket(true);
+              }
+            }
             const bridge = new DesktopStreamBridge(ws, {
               isEnabled: assistantDesktopEnabled,
             });
@@ -671,6 +704,11 @@ export class RuntimeHttpServer {
               "Desktop stream WebSocket closed",
             );
             data.bridge?.handleClose();
+            if (data.holdsLease) {
+              // A dropped socket is not a hand-back; the lease's idle clock
+              // starts instead (C3).
+              getLiveControl().noteDesktopSocket(false);
+            }
             return;
           }
           if (data.wsType === "live-watch") {
@@ -1241,7 +1279,13 @@ export class RuntimeHttpServer {
       req,
       server,
       "desktop stream",
-      () => ({ wsType: "desktop-stream" }) satisfies DesktopStreamWebSocketData,
+      () =>
+        ({
+          wsType: "desktop-stream",
+          liveScope: req.headers.get("x-vellum-stream-scope")?.trim() || null,
+          liveDeveloperId:
+            req.headers.get("x-vellum-aexy-developer-id")?.trim() || null,
+        }) satisfies DesktopStreamWebSocketData,
     );
   }
 

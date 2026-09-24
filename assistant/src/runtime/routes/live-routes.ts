@@ -5,9 +5,12 @@
  *
  * - `GET /v1/watch/snapshot` — the newest frame of the agent's page, for the
  *   "agents at work" tiles, which poll rather than stream.
+ * - `POST /v1/live/control` — pause, resume, instruct, stop, take control and
+ *   hand it back (see `live/live-control.ts`).
  */
 
 import { getDesktopSessionManager } from "../../desktop/desktop-session-manager.js";
+import { getLiveControl } from "../../live/live-control-runtime.js";
 import { isLiveViewEnabled } from "../../live/live-view-feature.js";
 import type { ScreencastFrame } from "../../live/screencast.js";
 import { getLiveWatchHub } from "../../live/watch-hub.js";
@@ -94,7 +97,46 @@ export function _resetWatchSnapshotForTests(): void {
   lastStill = null;
 }
 
+/** Exported for tests. */
+export async function handleLiveControlRoute(
+  body: unknown,
+  deps: {
+    enabled?: () => boolean;
+    handle?: (
+      body: unknown,
+    ) => Promise<{ status: number; body: Record<string, unknown> }>;
+  } = {},
+): Promise<RouteResponse> {
+  const enabled = deps.enabled ?? (() => isLiveViewEnabled());
+  if (!enabled()) {
+    throw new NotFoundError("The live view is not available on this assistant");
+  }
+  const handle = deps.handle ?? ((b) => getLiveControl().handle(b));
+  const result = await handle(body);
+  return new RouteResponse(
+    JSON.stringify(result.body),
+    { "content-type": "application/json" },
+    result.status,
+  );
+}
+
 export const ROUTES: RouteDefinition[] = [
+  {
+    operationId: "live_control",
+    endpoint: "live/control",
+    method: "POST",
+    policy: { requiredScopes: [], allowedPrincipalTypes: GATEWAY_PRINCIPALS },
+    handler: ({ body }) => handleLiveControlRoute(body),
+    summary: "Intervene in the running agent",
+    description:
+      "Aexy live view (C4.2): pause, resume, instruct, stop, acquire_control, release_control. signin_decision answers 501 not_implemented.",
+    tags: ["live"],
+    additionalResponses: {
+      "409": { description: "control_held or no_active_run" },
+      "422": { description: "Unknown command or malformed actor or text" },
+      "501": { description: "signin_decision is not implemented" },
+    },
+  },
   {
     operationId: "watch_snapshot",
     endpoint: "watch/snapshot",

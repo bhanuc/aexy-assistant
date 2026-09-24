@@ -237,6 +237,16 @@ forwards to the daemon `POST /v1/live/control`. Response passes back verbatim.
   `{display_name} handed back control ({outcome}): {note}` plus a fresh page
   screenshot to the conversation. The agent must re-verify the page. Returns
   `signinCandidates` captured during the lease (§4.7 of the plan).
+- Daemon details: `resume` while a lease is held → `409 control_held` (the
+  holder ends it with `release_control`, which resumes). `release_control` of
+  someone else's lease is allowed only for `owner|manager|admin`, else
+  `409 control_held`. A lease that expires (120 s with no desktop socket) is a
+  hand-back with `outcome:"cannot"`. Unknown commands or a malformed `actor`
+  → `422`. `pause`/`acquire_control` apply to `conversation_id` when given,
+  else the C2 target conversation.
+- **Not built yet (daemon):** `signin_decision` answers
+  `501 {"ok":false,"code":"not_implemented"}` and `release_control` returns
+  `signinCandidates: []`; nothing is captured.
 - `signin_decision` — for one candidate domain: if `save_password` /
   `save_session`, the daemon sends the captured values **directly** to the
   control plane (C7) — they never pass through Aexy. Otherwise it drops them and
