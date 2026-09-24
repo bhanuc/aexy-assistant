@@ -93,10 +93,11 @@ export async function readTaskQueue(
 export async function claimTask(
   taskId: string,
   signal?: AbortSignal,
+  conversationId?: string,
 ): Promise<TaskCallResult<WorkspaceTaskClaim>> {
   return call<WorkspaceTaskClaim>(
     `/v1/tasks/${encodeURIComponent(taskId)}/claim`,
-    { method: "POST", body: "{}" },
+    { method: "POST", body: conversationBody(conversationId) },
     signal,
   );
 }
@@ -112,12 +113,23 @@ export async function claimTask(
 export async function heartbeatTask(
   taskId: string,
   signal?: AbortSignal,
+  conversationId?: string,
 ): Promise<TaskCallResult<WorkspaceTaskClaim>> {
   return call<WorkspaceTaskClaim>(
     `/v1/tasks/${encodeURIComponent(taskId)}/heartbeat`,
-    { method: "POST", body: "{}" },
+    { method: "POST", body: conversationBody(conversationId) },
     signal,
   );
+}
+
+/**
+ * Which conversation is working the card (C8), so the workspace can say
+ * which run a card is and open its live view. Omitted until there is one.
+ */
+function conversationBody(conversationId: string | undefined): string {
+  return conversationId
+    ? JSON.stringify({ conversation_id: conversationId })
+    : "{}";
 }
 
 /** Leave a progress note in the card's ordinary activity feed. */

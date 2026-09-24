@@ -20,9 +20,15 @@ export interface ActiveTask {
   claim: WorkspaceTaskClaim;
   /** Set by the task tools so the runner knows the turn settled itself. */
   settled: "submitted" | "released" | null;
+  /**
+   * The conversation working the card, once the turn has one. Reported to
+   * the workspace on heartbeats (C8) and followed by the live view.
+   */
+  conversationId?: string;
 }
 
 let active: ActiveTask | null = null;
+const listeners = new Set<() => void>();
 
 export function getActiveTask(): ActiveTask | null {
   return active;
@@ -30,6 +36,32 @@ export function getActiveTask(): ActiveTask | null {
 
 export function setActiveTask(value: ActiveTask | null): void {
   active = value;
+  notify();
+}
+
+/** Record the conversation the active card's turn runs in. */
+export function setActiveTaskConversation(conversationId: string): void {
+  if (!active) {
+    return;
+  }
+  active.conversationId = conversationId;
+  notify();
+}
+
+/** Hear when the active card, or its conversation, changes. */
+export function onActiveTaskChange(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function notify(): void {
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch {
+      // A watcher's bookkeeping must never disturb the card.
+    }
+  }
 }
 
 export function markSettled(how: "submitted" | "released"): void {

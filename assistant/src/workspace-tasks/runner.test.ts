@@ -12,6 +12,10 @@ let connected = true;
 let queueResult: any;
 let claimResult: any;
 let heartbeatResult: any;
+const heartbeats: any[] = [];
+/** Set by the fake job to simulate the runner's conversation appearing. */
+let conversationDuringTurn: string | null = null;
+let activeDuringTurn: any = null;
 const released: any[] = [];
 let jobCalls: any[] = [];
 let jobResult: any = { ok: true, conversationId: "c1" };
@@ -45,7 +49,14 @@ mock.module("./client.js", () => ({
   canReachWorkspaceTasks: () => Promise.resolve(connected),
   readTaskQueue: () => Promise.resolve(queueResult),
   claimTask: () => Promise.resolve(claimResult),
-  heartbeatTask: () => Promise.resolve(heartbeatResult),
+  heartbeatTask: (
+    taskId: string,
+    _signal: unknown,
+    conversationId?: string,
+  ) => {
+    heartbeats.push({ taskId, conversationId });
+    return Promise.resolve(heartbeatResult);
+  },
   releaseTask: (taskId: string, reason: string) => {
     released.push({ taskId, reason });
     return Promise.resolve({ outcome: "ok", value: CLAIM });
@@ -57,6 +68,11 @@ mock.module("./client.js", () => ({
 mock.module("../runtime/background-job-runner.js", () => ({
   runBackgroundJob: async (options: any) => {
     jobCalls.push(options);
+    if (conversationDuringTurn) {
+      await options.onConversationCreated?.(conversationDuringTurn);
+      const { getActiveTask } = await import("./active-task.js");
+      activeDuringTurn = { ...getActiveTask() };
+    }
     if (settleDuringTurn) {
       const { markSettled } = await import("./active-task.js");
       markSettled(settleDuringTurn);
@@ -78,6 +94,9 @@ describe("running the next workspace task", () => {
     claimResult = { outcome: "ok", value: CLAIM };
     heartbeatResult = { outcome: "ok", value: CLAIM };
     released.length = 0;
+    heartbeats.length = 0;
+    conversationDuringTurn = null;
+    activeDuringTurn = null;
     jobCalls = [];
     jobResult = { ok: true, conversationId: "c1" };
     settleDuringTurn = "submitted";
@@ -193,6 +212,17 @@ describe("running the next workspace task", () => {
     expect(result.ran).toBe(false);
     // A pod runs one browser, one filesystem and one shell.
     expect(jobCalls).toHaveLength(0);
+  });
+
+  test("says which conversation works the card as soon as there is one (C8)", async () => {
+    conversationDuringTurn = "conv-9";
+    await runNextWorkspaceTask();
+    // The claim came before the conversation existed; the first heartbeat
+    // goes out at once rather than an interval later, carrying it.
+    expect(heartbeats).toEqual([
+      { taskId: "task-1", conversationId: "conv-9" },
+    ]);
+    expect(activeDuringTurn.conversationId).toBe("conv-9");
   });
 
   test("a pod not connected to a workspace does nothing quietly", async () => {

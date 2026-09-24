@@ -92,6 +92,14 @@ as `x-vellum-viewer-id` (= `x-velay-user-id`), `x-vellum-viewer-role`,
 `x-vellum-conversation-id`, plus the existing gateway service token.
 `/v1/desktop/stream` with scope ≠ `control` → close 4003.
 
+Upstream already serves `/v1/watch/stream` on the daemon (narration capture,
+no viewer headers). The daemon routes an upgrade to the live view **only when
+`x-vellum-stream-scope` is present on the gateway's dial**, so the gateway must
+always send it on this path and must strip every `x-vellum-viewer-*`,
+`x-vellum-stream-scope`, `x-vellum-live-session-id`,
+`x-vellum-aexy-developer-id`, `x-vellum-display-name` and
+`x-vellum-conversation-id` header from client input.
+
 ---
 
 ## C2. Watch stream — `/v1/watch/stream` [V], consumed by [A] frontend
@@ -148,11 +156,16 @@ No control commands on this socket — control goes through Aexy (C4).
 - An open viewer calls the platform's record-activity (throttled to 30 s) so the
   pod isn't slept.
 - On connect a `frame` with the last known frame is sent immediately if any.
+- A viewer whose token names no conversation follows the target order above;
+  when that target changes (a claim's turn starts) it is sent a fresh `hello`
+  carrying the new `conversationId`. `seq` is per socket and monotonic across
+  `event` and `frame` messages.
 
 ### Close codes
 
 `4003` forbidden · `4008` desktop feature disabled · `4010` agent has no browser
-open (socket stays usable for events; this is sent as `error` not close) ·
+open (socket stays usable for events; this is sent as
+`{"type":"error","code":"4010",…}`, not a close) ·
 `4013` (desktop stream only) someone else holds control · `4801` tunnel dropped
 (reconnect with a fresh token).
 
@@ -224,6 +237,16 @@ forwards to the daemon `POST /v1/live/control`. Response passes back verbatim.
   `{display_name} handed back control ({outcome}): {note}` plus a fresh page
   screenshot to the conversation. The agent must re-verify the page. Returns
   `signinCandidates` captured during the lease (§4.7 of the plan).
+- Daemon details: `resume` while a lease is held → `409 control_held` (the
+  holder ends it with `release_control`, which resumes). `release_control` of
+  someone else's lease is allowed only for `owner|manager|admin`, else
+  `409 control_held`. A lease that expires (120 s with no desktop socket) is a
+  hand-back with `outcome:"cannot"`. Unknown commands or a malformed `actor`
+  → `422`. `pause`/`acquire_control` apply to `conversation_id` when given,
+  else the C2 target conversation.
+- **Not built yet (daemon):** `signin_decision` answers
+  `501 {"ok":false,"code":"not_implemented"}` and `release_control` returns
+  `signinCandidates: []`; nothing is captured.
 - `signin_decision` — for one candidate domain: if `save_password` /
   `save_session`, the daemon sends the captured values **directly** to the
   control plane (C7) — they never pass through Aexy. Otherwise it drops them and
@@ -293,6 +316,22 @@ conversation to another except to `owner|manager|admin` via the threads index.
 The daemon prefixes each such turn's context with
 `You are talking with {display_name} ({role}).`
 
+**Daemon side** (behind `aexy-live-view`): a chat turn from someone on the list
+who is not the guardian reaches the daemon's `POST /v1/messages` with these
+headers, set only by the gateway (which strips client copies) and absent on
+the guardian's own turns:
+
+| Header | Value |
+| --- | --- |
+| `x-vellum-acting-user-id` | the entry's `platform_user_id` |
+| `x-vellum-acting-user-name` | `display_name`, URL-encoded UTF-8 |
+| `x-vellum-acting-user-role` | `owner \| manager \| admin \| member` (anything else is read as `member`) |
+| `x-vellum-acting-aexy-developer-id` | the entry's `aexy_developer_id` |
+
+A conversation such a person starts is keyed `aexy-user:<platform_user_id>:…`
+(the client's key, or a fresh one); a `conversationId` that is not one of theirs
+answers `404` as though it did not exist.
+
 ---
 
 ## C7. Saved sign-ins — [V] pod → [P] (pod credential)
@@ -301,7 +340,7 @@ The daemon prefixes each such turn's context with
 POST /v1/pod/signins
 Authorization: Bearer <assistant api key>
 {"domain":"venues.com","username":"ops@acme.com",
- "password":"… | null","cookies":[ CDP Network.Cookie … ] | null,
+ "password": null | "…", "cookies": null | [ CDP Network.Cookie … ],
  "saved_by_aexy_developer_id":"uuid","intervention_id":"uuid"}
 → 201 {"saved":["login","session"]}
 ```

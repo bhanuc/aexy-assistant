@@ -1,3 +1,4 @@
+import { noteAgentBrowserTarget } from "../../../live/agent-browser-target.js";
 import { getLogger } from "../../../util/logger.js";
 import {
   buildBrowserWsUrl,
@@ -600,6 +601,8 @@ export class CdpInspectClient implements ScopedCdpClient {
       },
       "Attached CdpInspectClient session",
     );
+    // The live view's screencast follows whichever page the agent drives.
+    noteAgentBrowserTarget(target);
 
     return { transport, sessionId, target, version };
   }

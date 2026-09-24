@@ -149,7 +149,9 @@ export async function parkInWorkspaceInbox(
       const responses = polled.body?.answer?.responses;
       return {
         outcome: "answered",
-        responses: Array.isArray(responses) ? responses : [],
+        responses: Array.isArray(responses)
+          ? (responses as InboxResponse[])
+          : [],
       };
     }
     if (status === "expired") {
@@ -164,7 +166,99 @@ export async function parkInWorkspaceInbox(
 /** A polled question, as much of it as this side reads. */
 interface PolledQuestion {
   status?: string;
-  answer?: { responses?: InboxResponse[] };
+  answer?: { responses?: InboxResponse[] | TakeoverResponse[] };
+}
+
+// ---------------------------------------------------------------------------
+// Takeover asks (Aexy live view, contract C8)
+// ---------------------------------------------------------------------------
+
+/** How a person answered a takeover ask, as Aexy records the hand-back. */
+export interface TakeoverResponse {
+  outcome?: "done" | "cannot";
+  note?: string;
+  by?: string;
+}
+
+export interface TakeoverAsk {
+  /** Idempotency key and the `takeover_id` a hand-back names. */
+  takeoverId: string;
+  reason: string;
+  whatToDo: string;
+  deadlineSeconds: number;
+  page?: { url: string; title: string };
+  assistantName?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Ask the workspace for someone to come and take the wheel: the same inbox a
+ * parked question uses, as `kind: "takeover"` with no questions, routed the
+ * same way (card assignee, then the agent's help assignee, then role).
+ */
+export async function postTakeoverAsk(
+  ask: TakeoverAsk,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const { platformBaseUrl, assistantApiKey, enabled } =
+    await resolveManagedProxyContext();
+  if (!enabled) {
+    return {
+      ok: false,
+      reason: "this assistant is not connected to a workspace",
+    };
+  }
+  const posted = await call(
+    `${platformBaseUrl}/v1/human-help/ask`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${assistantApiKey}`,
+      },
+      body: JSON.stringify({
+        origin_ref: ask.takeoverId,
+        kind: "takeover",
+        assistant_name: ask.assistantName,
+        context: ask.reason,
+        questions: [],
+        takeover: {
+          reason: ask.reason,
+          what_to_do: ask.whatToDo,
+          deadline_seconds: ask.deadlineSeconds,
+          ...(ask.page ? { page: ask.page } : {}),
+        },
+      }),
+    },
+    ask.signal,
+  );
+  return posted.ok ? { ok: true } : { ok: false, reason: posted.reason };
+}
+
+/** Where a takeover ask stands in the workspace, or `null` if unknown. */
+export async function pollTakeoverAsk(
+  takeoverId: string,
+  signal?: AbortSignal,
+): Promise<{ status: string; responses: TakeoverResponse[] } | null> {
+  const { platformBaseUrl, assistantApiKey, enabled } =
+    await resolveManagedProxyContext();
+  if (!enabled) {
+    return null;
+  }
+  const polled = await call(
+    `${platformBaseUrl}/v1/human-help/${encodeURIComponent(takeoverId)}`,
+    { method: "GET", headers: { authorization: `Bearer ${assistantApiKey}` } },
+    signal,
+  );
+  if (!polled.ok) {
+    return null;
+  }
+  const responses = polled.body?.answer?.responses;
+  return {
+    status: String(polled.body?.status ?? ""),
+    responses: Array.isArray(responses)
+      ? (responses as TakeoverResponse[])
+      : [],
+  };
 }
 
 type CallResult =

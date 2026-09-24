@@ -109,6 +109,7 @@ import { ROUTES as INTERNAL_OAUTH_ROUTES } from "./internal-oauth-routes.js";
 import { ROUTES as INTERNAL_TELEMETRY_ROUTES } from "./internal-telemetry-routes.js";
 import { ROUTES as INTERNAL_TWILIO_ROUTES } from "./internal-twilio-routes.js";
 import { ROUTES as LIFECYCLE_ROUTES } from "./lifecycle-routes.js";
+import { ROUTES as LIVE_ROUTES } from "./live-routes.js";
 import { ROUTES as LIVE_VOICE_ROUTES } from "./live-voice-routes.js";
 import { ROUTES as LLM_CALL_SITES_ROUTES } from "./llm-call-sites-routes.js";
 import { ROUTES as LOG_EXPORT_ROUTES } from "./log-export-routes.js";
@@ -222,6 +223,7 @@ export const ROUTES: RouteDefinition[] = [
   ...DEBUG_ROUTES,
   ...DEFAULT_PROVIDER_ROUTES,
   ...DESKTOP_SETUP_ROUTES,
+  ...LIVE_ROUTES,
   ...DIAGNOSTICS_ROUTES,
   ...DISK_PRESSURE_ROUTES,
   ...RESOURCE_PRESSURE_ROUTES,

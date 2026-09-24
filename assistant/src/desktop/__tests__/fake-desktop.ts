@@ -49,6 +49,11 @@ export interface FakeDesktopOptions {
   exitOnKill?: boolean;
   sourceEnv?: NodeJS.ProcessEnv;
   renderWallpaper?: (width: number, height: number) => Promise<Buffer | null>;
+  /** DevTools port for the desktop Chrome; none unless a test asks. */
+  remoteDebuggingPort?: number | null;
+  /** Whether a HOME is writable; every HOME is unless a test says not. */
+  isWritableDir?: (path: string) => boolean;
+  fallbackHomeDir?: string;
 }
 
 export function newFakeDesktop(options: FakeDesktopOptions) {
@@ -85,6 +90,10 @@ export function newFakeDesktop(options: FakeDesktopOptions) {
     panelConfigDir:
       options.panelConfigDir ?? join(options.profileDir, "desktop-panel"),
     sourceEnv: options.sourceEnv,
+    remoteDebuggingPort: () => options.remoteDebuggingPort ?? null,
+    isWritableDir: options.isWritableDir ?? (() => true),
+    fallbackHomeDir:
+      options.fallbackHomeDir ?? join(options.profileDir, "desktop-home"),
   });
   return {
     manager,

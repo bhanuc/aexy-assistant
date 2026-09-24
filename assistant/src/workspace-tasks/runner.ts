@@ -30,6 +30,8 @@
  * browser step cannot be relied on to call it.
  */
 
+import { holdDesktopForClaim } from "../live/desktop-browser.js";
+import { isLiveViewEnabled } from "../live/live-view-feature.js";
 import { runBackgroundJob } from "../runtime/background-job-runner.js";
 import { wrapUntrustedContent } from "../security/untrusted-content.js";
 import { getLogger } from "../util/logger.js";
@@ -37,6 +39,7 @@ import {
   type ActiveTask,
   getActiveTask,
   setActiveTask,
+  setActiveTaskConversation,
 } from "./active-task.js";
 import {
   canReachWorkspaceTasks,
@@ -116,7 +119,13 @@ async function workClaimedTask(
 ): Promise<TaskRunOutcome> {
   const active: ActiveTask = { task, claim, settled: null };
   setActiveTask(active);
-  const stopHeartbeat = startHeartbeat(claim, signal);
+  const heartbeat = startHeartbeat(active, signal);
+  // Under the live view the desktop the agent browses on stays up for the
+  // whole claim, not just the linger after its last browser call, so the page
+  // it left is still there for whoever opens the watch view mid-task.
+  const releaseDesktop = isLiveViewEnabled()
+    ? holdDesktopForClaim(claim.id)
+    : () => {};
 
   try {
     const timeoutMs = turnBudgetMs(claim);
@@ -136,6 +145,13 @@ async function workClaimedTask(
       callSite: "mainAgent",
       timeoutMs,
       origin: "task",
+      // The claim was taken before the conversation existed, so the first
+      // chance to say which conversation works the card is now: beat at once
+      // rather than a heartbeat interval later (C8).
+      onConversationCreated: (conversationId) => {
+        setActiveTaskConversation(conversationId);
+        heartbeat.beatNow();
+      },
       assistantSandwich: {
         preamble: PREAMBLE,
         content: renderTask(task, claim),
@@ -174,7 +190,8 @@ async function workClaimedTask(
     }
     return { ran: true, taskId: task.id, settled: "released" };
   } finally {
-    stopHeartbeat();
+    heartbeat.stop();
+    releaseDesktop();
     setActiveTask(null);
   }
 }
@@ -204,28 +221,40 @@ function turnBudgetMs(claim: WorkspaceTaskClaim, now = Date.now()): number {
  * something.
  */
 function startHeartbeat(
-  claim: WorkspaceTaskClaim,
+  active: ActiveTask,
   signal?: AbortSignal,
-): () => void {
+): { stop: () => void; beatNow: () => void } {
+  const { claim } = active;
   const everyMs = Math.max(15, claim.heartbeat_every_seconds || 120) * 1000;
-  const timer = setInterval(() => {
-    void (async () => {
-      const beat = await heartbeatTask(claim.task_id, signal);
-      if (beat.outcome === "refused") {
-        log.info(
-          { taskId: claim.task_id, reason: beat.reason },
-          "The claim is gone; the turn no longer holds this task",
-        );
-        setActiveTask(null);
-        clearInterval(timer);
-      }
-      // `unavailable` is the network, not a decision. Keep beating: losing
-      // the card because a request timed out would be a worse failure than
-      // the one it protects against.
-    })();
-  }, everyMs);
+  let stopped = false;
+  const beat = async () => {
+    if (stopped) {
+      return;
+    }
+    const result = await heartbeatTask(
+      claim.task_id,
+      signal,
+      active.conversationId,
+    );
+    if (result.outcome === "refused" && !stopped) {
+      log.info(
+        { taskId: claim.task_id, reason: result.reason },
+        "The claim is gone; the turn no longer holds this task",
+      );
+      setActiveTask(null);
+      stop();
+    }
+    // `unavailable` is the network, not a decision. Keep beating: losing
+    // the card because a request timed out would be a worse failure than
+    // the one it protects against.
+  };
+  const timer = setInterval(() => void beat(), everyMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  const stop = () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+  return { stop, beatNow: () => void beat() };
 }
 
 function taskTitle(task: WorkspaceTask): string {
