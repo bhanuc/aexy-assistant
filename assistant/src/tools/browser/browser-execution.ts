@@ -1,6 +1,7 @@
 import { optimizeImageForTransport } from "../../agent/image-optimize.js";
 import { getConfig } from "../../config/loader.js";
 import { HostBrowserProxy } from "../../daemon/host-browser-proxy.js";
+import { isLiveViewEnabled } from "../../live/live-view-feature.js";
 import type { ImageContent } from "../../providers/types.js";
 import { wrapUntrustedContent } from "../../security/untrusted-content.js";
 import { getLogger } from "../../util/logger.js";
@@ -139,6 +140,15 @@ const MAX_SNAPSHOT_FENCE_CHARS = 100_000;
 const MAX_PAGE_HEADER_CHARS = 500;
 
 /** Read the current page URL, credential-stripped and length-bounded. */
+/** The host a person will recognise, for a takeover ask's title. */
+function safeHostname(url: string): string {
+  try {
+    return new URL(url).hostname || "this page";
+  } catch {
+    return "this page";
+  }
+}
+
 async function readPageUrl(
   cdp: CdpClient,
   signal?: AbortSignal,
@@ -1266,7 +1276,36 @@ export async function executeBrowserNavigate(
           // to the text-only "solve manually" branch because the user
           // already owns their Chrome window.
           let cleared = false;
-          if (cdp.kind === "local" && sender) {
+          // Aexy live view (fork): the agent's browser is the desktop people
+          // can drive, so ask one of them to take over (D5) rather than wait
+          // on a URL change for someone who was never told.
+          let takeoverNote: string | null = null;
+          if (cdp.kind === "cdp-inspect" && isLiveViewEnabled()) {
+            const { requestLiveTakeover } =
+              await import("../../live/live-control-runtime.js");
+            const { describeTakeover } = await import("../../live/takeover.js");
+            const pageUrl = await readPageUrl(cdp, context.signal).catch(
+              () => finalUrl,
+            );
+            const pageTitle = await readPageTitle(cdp, context.signal).catch(
+              () => "",
+            );
+            const takeover = await requestLiveTakeover({
+              reason: `CAPTCHA on ${safeHostname(pageUrl)}`,
+              whatToDo:
+                "Solve the verification on this page, wait for it to move on, then hand back.",
+              page: { url: pageUrl, title: pageTitle },
+              signal: context.signal,
+            });
+            takeoverNote = describeTakeover(takeover);
+            if (context.signal?.aborted) {
+              return { content: "Navigation cancelled.", isError: true };
+            }
+            // Handing back is not proof: look again (D5).
+            cleared =
+              takeover.outcome === "handed_back" &&
+              !(await detectCaptchaChallenge(cdp, context.signal));
+          } else if (cdp.kind === "local" && sender) {
             const { startHandoff } = await import("./browser-handoff.js");
             const outcome = await startHandoff(context.conversationId, {
               reason: "captcha",
@@ -1285,11 +1324,19 @@ export async function executeBrowserNavigate(
               !(await detectCaptchaChallenge(cdp, context.signal));
           }
 
+          if (takeoverNote) {
+            lines.push("");
+            lines.push(takeoverNote);
+          }
           if (cleared) {
             const newUrl = await readPageUrl(cdp, context.signal);
             const newTitle = await readPageTitle(cdp, context.signal);
             lines.push("");
-            lines.push("CAPTCHA solved by user. Current page:");
+            lines.push(
+              takeoverNote
+                ? "The CAPTCHA is no longer on the page. Current page:"
+                : "CAPTCHA solved by user. Current page:",
+            );
             lines.push(fencePageContent(`${newTitle} (${newUrl})`, newUrl));
 
             // Re-check for auth challenges - the page behind the CAPTCHA may have a login form

@@ -21,6 +21,11 @@ import { getLogger } from "../util/logger.js";
 import { getActiveTask, markSettled } from "../workspace-tasks/active-task.js";
 import { releaseTask } from "../workspace-tasks/client.js";
 import { installLiveControl, LiveControl } from "./live-control.js";
+import {
+  requestTakeover,
+  type TakeoverRequest,
+  type TakeoverResult,
+} from "./takeover.js";
 import { getLiveWatchHub } from "./watch-hub.js";
 import { resolveWatchFollowTarget } from "./watch-target.js";
 
@@ -141,4 +146,14 @@ async function releaseActiveTask(reason: string): Promise<void> {
       "Could not return a stopped task; leaving it to the workspace sweep",
     );
   }
+}
+
+/** The agent asks a person to take over (D5), with the daemon's wiring. */
+export function requestLiveTakeover(
+  request: TakeoverRequest,
+): Promise<TakeoverResult> {
+  return requestTakeover(request, {
+    control: getLiveControl(),
+    viewerCount: () => getLiveWatchHub().viewerCount,
+  });
 }
