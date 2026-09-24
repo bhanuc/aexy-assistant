@@ -7,6 +7,10 @@
  * that must survive injection downgrade.
  */
 
+import {
+  getConversationSpeaker,
+  speakerLine,
+} from "../../../live/acting-user.js";
 import type { InjectionBlock, Injector, TurnContext } from "../../types.js";
 import { DEFAULT_INJECTOR_ORDER } from "../injector-order.js";
 import { buildUnifiedTurnContextBlock } from "./unified-turn-context.js";
@@ -47,9 +51,12 @@ const unifiedTurnContextInjector: Injector = {
       timeSinceLastMessage: ctx.timeSinceLastMessage,
       modelProfile: ctx.modelProfile,
     });
+    // Aexy live view (fork, C6): a turn from someone on the access list who
+    // is not the guardian names them first.
+    const speaker = getConversationSpeaker(ctx.conversationId);
     return {
       id: "unified-turn-context",
-      text,
+      text: speaker ? `${speakerLine(speaker)}\n${text}` : text,
       placement: "prepend-user-tail",
     };
   },

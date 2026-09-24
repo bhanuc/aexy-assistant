@@ -316,6 +316,22 @@ conversation to another except to `owner|manager|admin` via the threads index.
 The daemon prefixes each such turn's context with
 `You are talking with {display_name} ({role}).`
 
+**Daemon side** (behind `aexy-live-view`): a chat turn from someone on the list
+who is not the guardian reaches the daemon's `POST /v1/messages` with these
+headers, set only by the gateway (which strips client copies) and absent on
+the guardian's own turns:
+
+| Header | Value |
+| --- | --- |
+| `x-vellum-acting-user-id` | the entry's `platform_user_id` |
+| `x-vellum-acting-user-name` | `display_name`, URL-encoded UTF-8 |
+| `x-vellum-acting-user-role` | `owner \| manager \| admin \| member` (anything else is read as `member`) |
+| `x-vellum-acting-aexy-developer-id` | the entry's `aexy_developer_id` |
+
+A conversation such a person starts is keyed `aexy-user:<platform_user_id>:…`
+(the client's key, or a fresh one); a `conversationId` that is not one of theirs
+answers `404` as though it did not exist.
+
 ---
 
 ## C7. Saved sign-ins — [V] pod → [P] (pod credential)

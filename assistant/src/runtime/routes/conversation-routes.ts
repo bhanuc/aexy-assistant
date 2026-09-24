@@ -103,6 +103,13 @@ import {
   writeRelationshipState,
 } from "../../home/relationship-state-writer.js";
 import { ipcCall } from "../../ipc/gateway-client.js";
+import {
+  actingUserConversationKey,
+  conversationBelongsTo,
+  getConversationSpeaker,
+  readActingUser,
+  setConversationSpeaker,
+} from "../../live/acting-user.js";
 import { buildSlackMessageDeepLinks } from "../../messaging/providers/slack/deep-link.js";
 import {
   readSlackMetadataFromMessageMetadata,
@@ -1620,6 +1627,9 @@ export async function handleSendMessage(
   const principalType = headers?.["x-vellum-principal-type"];
   const originClientId = headers?.["x-vellum-client-id"]?.trim() || undefined;
   const clientMetadata = readClientMetadataHeaders(headers);
+  // Aexy live view (fork, C6): someone on the access list other than the
+  // guardian, as the gateway attests. Their threads are theirs alone.
+  const actingUser = readActingUser(headers);
 
   const { conversationKey, content, attachmentIds } = body;
   const inboundConversationId =
@@ -1809,7 +1819,10 @@ export async function handleSendMessage(
   };
   if (inboundConversationId !== undefined) {
     const existing = getConversation(inboundConversationId);
-    if (!existing) {
+    if (
+      !existing ||
+      (actingUser && !conversationBelongsTo(existing.id, actingUser))
+    ) {
       throw new NotFoundError(
         `Conversation ${inboundConversationId} not found`,
       );
@@ -1820,8 +1833,9 @@ export async function handleSendMessage(
       created: false,
     };
   } else {
-    const resolvedConversationKey =
-      conversationKey && conversationKey.length > 0
+    const resolvedConversationKey = actingUser
+      ? actingUserConversationKey(actingUser, conversationKey)
+      : conversationKey && conversationKey.length > 0
         ? conversationKey
         : sourceChannel === "vellum"
           ? crypto.randomUUID()
@@ -1839,6 +1853,11 @@ export async function handleSendMessage(
       // message.
       origin: sourceChannel,
     });
+  }
+
+  // Every send says who is speaking now; the guardian's clears it.
+  if (actingUser || getConversationSpeaker(mapping.conversationId)) {
+    setConversationSpeaker(mapping.conversationId, actingUser);
   }
 
   if (requestedRiskThreshold !== undefined) {
