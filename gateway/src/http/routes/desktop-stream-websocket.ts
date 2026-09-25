@@ -3,6 +3,11 @@
  * to the runtime as a raw RFB (VNC) byte pipe with close codes relayed
  * verbatim. Guardian-only: the proxy replaces the caller's identity upstream,
  * so this upgrade is the only place a non-guardian actor can be refused.
+ *
+ * Aexy live view (flag `aexy-live-view`) adds one other way in: an upgrade the
+ * tunnel attests `scope=control` for, handed to `live-stream-websocket.ts`
+ * before the pin runs. Any other attested scope is closed with 4003; whether
+ * this person holds the control lease is the daemon's to say (4013).
  */
 
 import {
@@ -10,7 +15,9 @@ import {
   type RuntimeAudioStreamState,
 } from "./runtime-audio-stream.js";
 import { authorizeGuardianStream } from "./guardian-pin.js";
+import { upgradeLiveStream } from "./live-stream-websocket.js";
 import type { GatewayConfig } from "../../config.js";
+import { authorizeLiveStream } from "../../live-view/stream-auth.js";
 import { getLogger } from "../../logger.js";
 
 const log = getLogger("desktop-stream-ws");
@@ -25,6 +32,17 @@ export function createDesktopStreamWebsocketHandler(config: GatewayConfig) {
     req: Request,
     server: import("bun").Server<unknown>,
   ): Promise<Response | undefined> {
+    const live = authorizeLiveStream(req, config, "/v1/desktop/stream", log);
+    if (live.kind !== "not-live") {
+      return upgradeLiveStream(
+        req,
+        server,
+        config,
+        live,
+        "live-desktop-stream",
+      );
+    }
+
     const denied = await authorizeGuardianStream(req, config, log);
     if (denied) {
       return denied;

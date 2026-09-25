@@ -6,12 +6,16 @@
  * last one leaves so a reconnect is instant.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { readAvatarState } from "../avatar/avatar-manifest.js";
 import { resolveNotificationAccentHex } from "../avatar/notification-avatar.js";
 import { getIsContainerized } from "../config/env-registry.js";
+import {
+  DESKTOP_CDP_PORT,
+  isLiveViewEnabled,
+} from "../live/live-view-feature.js";
 import { terminateProcessTree } from "../util/host-process.js";
 import { getLogger } from "../util/logger.js";
 import { getDataDir } from "../util/platform.js";
@@ -177,7 +181,23 @@ interface DesktopSessionManagerOptions {
   ) => Promise<Buffer | null>;
   /** Where the children's allowlisted env is read from. */
   readonly sourceEnv?: NodeJS.ProcessEnv;
+  /**
+   * Loopback DevTools port for the desktop Chrome, read at each launch, or
+   * `null` for none. Set when the live view has the agent drive this Chrome
+   * (see `live/live-view-feature.ts`); upstream's desktop never opens one.
+   */
+  readonly remoteDebuggingPort?: () => number | null;
+  /**
+   * HOME for the children when the daemon's own is not writable. A managed
+   * pod's root filesystem is read-only, and Chrome's crash handler exits the
+   * browser at launch when it cannot write under HOME.
+   */
+  readonly fallbackHomeDir?: string;
+  readonly isWritableDir?: (path: string) => boolean;
 }
+
+/** What a watcher is told about the desktop. */
+export type DesktopState = "off" | "starting" | "ready";
 
 type DesktopBinaries = ReturnType<typeof resolveDesktopBinaries>;
 
@@ -190,6 +210,12 @@ export class DesktopSessionManager {
   /** Bumped on every teardown so an in-flight start notices it lost its tree. */
   private generation = 0;
   private viewer: DesktopViewer | null = null;
+  /**
+   * Reasons besides a viewer to keep the tree up: the agent is browsing on it,
+   * or a workspace-task claim is open. Each holds it the way a viewer does, so
+   * the linger only starts once nobody and nothing needs the desktop.
+   */
+  private readonly holds = new Set<string>();
   private lingerTimer: ReturnType<typeof setTimeout> | null = null;
   private ingressClosed = false;
   private browserExitsAt: number[] = [];
@@ -222,6 +248,9 @@ export class DesktopSessionManager {
     DesktopSessionManagerOptions["renderWallpaper"]
   >;
   private readonly sourceEnv: NodeJS.ProcessEnv;
+  private readonly remoteDebuggingPort: () => number | null;
+  private readonly fallbackHomeDir: string;
+  private readonly isWritableDir: (path: string) => boolean;
 
   constructor(options: DesktopSessionManagerOptions = {}) {
     this.spawn = options.spawn ?? spawnDetached;
@@ -251,6 +280,12 @@ export class DesktopSessionManager {
     this.sourceEnv = options.sourceEnv ?? process.env;
     this.renderWallpaper =
       options.renderWallpaper ?? renderCurrentDesktopWallpaper;
+    this.remoteDebuggingPort =
+      options.remoteDebuggingPort ??
+      (() => (isLiveViewEnabled() ? DESKTOP_CDP_PORT : null));
+    this.fallbackHomeDir =
+      options.fallbackHomeDir ?? join(getDataDir(), "desktop-home");
+    this.isWritableDir = options.isWritableDir ?? isWritableDir;
   }
 
   // ── Viewer slot ────────────────────────────────────────────────────
@@ -276,6 +311,48 @@ export class DesktopSessionManager {
       return;
     }
     this.viewer = null;
+    this.armLingerIfUnused();
+  }
+
+  // ── Holds ──────────────────────────────────────────────────────────
+
+  /**
+   * Keep the desktop up for `key` until {@link release}. Repeating a key is a
+   * no-op, so a caller that holds once per claim cannot leak holds by
+   * holding again.
+   */
+  hold(key: string): void {
+    this.holds.add(key);
+    this.clearLinger();
+  }
+
+  release(key: string): void {
+    if (!this.holds.delete(key)) {
+      return;
+    }
+    this.armLingerIfUnused();
+  }
+
+  /**
+   * Start the linger when nothing holds the desktop. For a caller that
+   * started the tree without taking a hold (a one-off browser call), so it
+   * comes down on its own instead of running until the next viewer leaves.
+   */
+  touch(): void {
+    this.armLingerIfUnused();
+  }
+
+  getState(): DesktopState {
+    if (this.running) {
+      return "ready";
+    }
+    return this.starting ? "starting" : "off";
+  }
+
+  private armLingerIfUnused(): void {
+    if (this.viewer || this.holds.size > 0) {
+      return;
+    }
     if (this.running || this.starting) {
       this.armLinger();
     }
@@ -436,7 +513,11 @@ export class DesktopSessionManager {
       }
       mkdirSync(this.profileDir, { recursive: true });
       this.startPanel(executable, env);
-      this.launch("browser", browserCommand(executable, this.profileDir), env);
+      this.launch(
+        "browser",
+        browserCommand(executable, this.profileDir, this.remoteDebuggingPort()),
+        env,
+      );
     } catch (err) {
       log.warn({ err }, "Desktop browser failed to launch");
       if (this.generation === generation) {
@@ -551,7 +632,9 @@ export class DesktopSessionManager {
    * stranded on an empty desktop, unless it keeps dying.
    */
   private onBrowserExit(): void {
-    if (!this.viewer || !this.running) {
+    // A hold means the agent is using this Chrome, and a dead one strands it
+    // exactly as it would strand a viewer.
+    if ((!this.viewer && this.holds.size === 0) || !this.running) {
       return;
     }
     const now = Date.now();
@@ -676,8 +759,25 @@ export class DesktopSessionManager {
         env[key] = value;
       }
     }
+    if (!env.HOME || !this.isWritableDir(env.HOME)) {
+      try {
+        mkdirSync(this.fallbackHomeDir, { recursive: true });
+        env.HOME = this.fallbackHomeDir;
+      } catch (err) {
+        log.warn({ err }, "Desktop fallback home could not be created");
+      }
+    }
     env.DISPLAY = DESKTOP_DISPLAY;
     return env;
+  }
+}
+
+function isWritableDir(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -710,8 +810,22 @@ function xServerCommand(executable: string): string[] {
   ];
 }
 
-function browserCommand(executable: string, profileDir: string): string[] {
+function browserCommand(
+  executable: string,
+  profileDir: string,
+  remoteDebuggingPort: number | null = null,
+): string[] {
   // Root containers require --no-sandbox; set geometry before openbox maps it.
+  // DevTools listens on loopback only: the pod's own processes may drive this
+  // Chrome, nothing outside it can. Chrome refuses the port on its default
+  // profile, and this one never is.
+  const devtools =
+    remoteDebuggingPort === null
+      ? []
+      : [
+          `--remote-debugging-port=${remoteDebuggingPort}`,
+          "--remote-debugging-address=127.0.0.1",
+        ];
   return [
     executable,
     "--no-sandbox",
@@ -721,6 +835,7 @@ function browserCommand(executable: string, profileDir: string): string[] {
     "--window-position=0,0",
     `--window-size=${DESKTOP_WIDTH},${DESKTOP_HEIGHT}`,
     `--user-data-dir=${profileDir}`,
+    ...devtools,
   ];
 }
 

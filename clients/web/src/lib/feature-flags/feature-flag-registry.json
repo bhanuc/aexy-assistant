@@ -519,6 +519,14 @@
       "label": "Assistant Desktop",
       "description": "Streams an interactive desktop from a containerized assistant pod to the web client over /v1/desktop/stream. Off: no desktop affordance is rendered. On: the chat header offers a desktop panel that views and controls the pod's display.",
       "defaultEnabled": false
+    },
+    {
+      "id": "aexy-live-view",
+      "scope": "assistant",
+      "key": "aexy-live-view",
+      "label": "Aexy Live View",
+      "description": "Aexy fork: lets people watch, drive and chat with a pod through Aexy. With assistant-desktop on in a container, the browser tool drives the desktop's own Chrome over CDP; the daemon serves the multi-viewer /v1/watch/stream screencast and event timeline, /v1/watch/snapshot and /v1/live/control (pause, instruct, stop, take over, hand back); the gateway authorizes those streams by the tunnel-attested stream scope, serves the service-authenticated /v1/live/* routes, and accepts chat from the pushed access list. Off: upstream behaviour \u2014 a headless browser nobody can see, and the guardian pin as the only way in.",
+      "defaultEnabled": false
     }
   ]
 }

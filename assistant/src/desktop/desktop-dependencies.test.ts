@@ -1,6 +1,10 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 
 import {
+  desktopChromePath,
   DesktopDependencyInstaller,
   type DesktopSetupStatus,
 } from "./desktop-dependencies.js";
@@ -98,5 +102,30 @@ describe("desktop dependency installation", () => {
     f.unsupported();
     expect(f.installer.start().state).toBe("unsupported");
     expect(f.install).not.toHaveBeenCalled();
+  });
+});
+
+describe("a Chrome baked into the image", () => {
+  test("is preferred once its ready marker exists, and ignored before", () => {
+    const root = mkdtempSync(join(tmpdir(), "baked-desktop-"));
+    try {
+      const external = desktopChromePath(root);
+      expect(external.startsWith(root)).toBe(false);
+
+      const baked = join(
+        root,
+        "chrome-153.0.8010.36-1",
+        "opt/google/chrome/chrome",
+      );
+      mkdirSync(dirname(baked), { recursive: true });
+      writeFileSync(baked, "");
+      // A binary without the marker is an interrupted bake, not a Chrome.
+      expect(desktopChromePath(root)).toBe(external);
+
+      writeFileSync(baked + ".ready", "");
+      expect(desktopChromePath(root)).toBe(baked);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

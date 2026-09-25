@@ -32,6 +32,7 @@ import {
   type RouteSchemaPolicy,
 } from "../../ipc/route-schema-cache.js";
 import { getLogger } from "../../logger.js";
+import { stripLiveViewIdentityHeaderRecord } from "../../live-view/identity-headers.js";
 
 const log = getLogger("ipc-runtime-proxy");
 
@@ -176,6 +177,9 @@ export async function tryIpcProxy(
   delete headers["x-vellum-actor-principal-id"];
   delete headers["x-vellum-principal-type"];
   delete headers["x-vellum-subject"];
+  // The Aexy live-view identity headers are the gateway's to set, never the
+  // caller's (`live-view/identity-headers.ts`).
+  stripLiveViewIdentityHeaderRecord(headers);
   if (claims) {
     const sub = parseSub(claims.sub);
     if (sub.ok) {

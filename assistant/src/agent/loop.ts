@@ -23,6 +23,7 @@ import type {
   PreModelCallInputContext,
   StopInputContext,
 } from "../hooks/types.js";
+import { waitWhileLivePaused } from "../live/live-control.js";
 import {
   timeSyncSection,
   traceAsyncSection,
@@ -1672,6 +1673,14 @@ export class AgentLoop {
         await stopTurn("aborted_pre_call");
         break;
       }
+      // Aexy live view (fork): a person paused this agent, so the step
+      // boundary before the next model call waits for them. A no-op
+      // unless the live view installed its control.
+      await waitWhileLivePaused(this.conversationId, signal);
+      if (signal?.aborted) {
+        await stopTurn("aborted_pre_call");
+        break;
+      }
 
       rlog.info(
         { turn: toolUseTurns, messageCount: history.length },
@@ -2727,6 +2736,10 @@ export class AgentLoop {
             input: toolUse.input,
           });
         }
+
+        // Aexy live view (fork): the step boundary before tools, too. A
+        // stop that arrives while paused lands in the abort path below.
+        await waitWhileLivePaused(this.conversationId, signal);
 
         // If already cancelled, synthesize cancelled results and stop. No call
         // was dispatched, so nothing can still be running.

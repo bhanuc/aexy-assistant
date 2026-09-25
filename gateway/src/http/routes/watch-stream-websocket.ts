@@ -24,7 +24,9 @@ import {
   type RuntimeAudioStreamState,
 } from "./runtime-audio-stream.js";
 import { authorizeGuardianStream } from "./guardian-pin.js";
+import { upgradeLiveStream } from "./live-stream-websocket.js";
 import type { GatewayConfig } from "../../config.js";
+import { authorizeLiveStream } from "../../live-view/stream-auth.js";
 import { getLogger } from "../../logger.js";
 
 const log = getLogger("watch-stream-ws");
@@ -120,12 +122,22 @@ export function watchStreamUpstreamParams(
  * the caller's identity with a service token upstream, leaving the daemon no
  * way to tell one actor from another. This upgrade is therefore the only place
  * a non-guardian actor can be refused, so it is refused here.
+ *
+ * **Aexy live view** (flag `aexy-live-view`): an upgrade the tunnel attests a
+ * stream scope for is someone Aexy decided may watch the agent, not the
+ * guardian's narration session, and is handed to `live-stream-websocket.ts`
+ * before the pin runs. Without that attestation nothing here changes.
  */
 export function createWatchStreamWebsocketHandler(config: GatewayConfig) {
   return async function handleUpgrade(
     req: Request,
     server: import("bun").Server<unknown>,
   ): Promise<Response | undefined> {
+    const live = authorizeLiveStream(req, config, "/v1/watch/stream", log);
+    if (live.kind !== "not-live") {
+      return upgradeLiveStream(req, server, config, live, "live-watch-stream");
+    }
+
     const denied = await authorizeGuardianStream(req, config, log);
     if (denied) {
       return denied;

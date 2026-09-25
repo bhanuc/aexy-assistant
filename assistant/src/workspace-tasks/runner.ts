@@ -30,6 +30,9 @@
  * browser step cannot be relied on to call it.
  */
 
+import { findConversation } from "../daemon/conversation-registry.js";
+import { holdDesktopForClaim } from "../live/desktop-browser.js";
+import { isLiveViewEnabled } from "../live/live-view-feature.js";
 import { runBackgroundJob } from "../runtime/background-job-runner.js";
 import { wrapUntrustedContent } from "../security/untrusted-content.js";
 import { getLogger } from "../util/logger.js";
@@ -37,6 +40,7 @@ import {
   type ActiveTask,
   getActiveTask,
   setActiveTask,
+  setActiveTaskConversation,
 } from "./active-task.js";
 import {
   canReachWorkspaceTasks,
@@ -116,10 +120,17 @@ async function workClaimedTask(
 ): Promise<TaskRunOutcome> {
   const active: ActiveTask = { task, claim, settled: null };
   setActiveTask(active);
-  const stopHeartbeat = startHeartbeat(claim, signal);
+  const heartbeat = startHeartbeat(active, signal);
+  // Under the live view the desktop the agent browses on stays up for the
+  // whole claim, not just the linger after its last browser call, so the page
+  // it left is still there for whoever opens the watch view mid-task.
+  const releaseDesktop = isLiveViewEnabled()
+    ? holdDesktopForClaim(claim.id)
+    : () => {};
 
   try {
-    const timeoutMs = turnBudgetMs(claim);
+    const startedAt = Date.now();
+    const timeoutMs = turnBudgetMs(claim, startedAt);
     log.info(
       { taskId: task.id, claimId: claim.id, timeoutMs },
       "Working a workspace task",
@@ -136,6 +147,13 @@ async function workClaimedTask(
       callSite: "mainAgent",
       timeoutMs,
       origin: "task",
+      // The claim was taken before the conversation existed, so the first
+      // chance to say which conversation works the card is now: beat at once
+      // rather than a heartbeat interval later (C8).
+      onConversationCreated: (conversationId) => {
+        setActiveTaskConversation(conversationId);
+        heartbeat.beatNow();
+      },
       assistantSandwich: {
         preamble: PREAMBLE,
         content: renderTask(task, claim),
@@ -148,6 +166,10 @@ async function workClaimedTask(
         { taskId: task.id, err: result.error },
         "The turn working a task failed",
       );
+    }
+
+    if (!active.settled) {
+      await awaitFollowUpTurns(active, startedAt + timeoutMs, signal);
     }
 
     if (active.settled) {
@@ -174,8 +196,54 @@ async function workClaimedTask(
     }
     return { ran: true, taskId: task.id, settled: "released" };
   } finally {
-    stopHeartbeat();
+    heartbeat.stop();
+    releaseDesktop();
     setActiveTask(null);
+  }
+}
+
+/** How often the runner looks at a conversation still taking instructions. */
+export const FOLLOW_UP_POLL_MS = 250;
+
+/**
+ * How long a conversation must stay idle, with nothing queued, before the card
+ * is decided. A queued message starts its turn only after the last one is
+ * finalized, so idle for an instant is not idle.
+ */
+export const FOLLOW_UP_GRACE_MS = 1_500;
+
+/**
+ * Let the turns an instruction queued on the card's conversation finish.
+ *
+ * An instruction sent through the live view is queued, not steered: the turn
+ * in flight yields at its next checkpoint and the instruction runs as the next
+ * turn, on the same conversation, still working the same card. Deciding the
+ * card when the first turn ends gives it back just as the agent was told how
+ * to finish it. So wait until the conversation is idle with nothing queued,
+ * the card is settled, or the budget runs out.
+ */
+async function awaitFollowUpTurns(
+  active: ActiveTask,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const conversation = findConversation(active.conversationId);
+  if (!conversation) {
+    return;
+  }
+  const busy = () =>
+    conversation.isProcessing() || conversation.hasQueuedMessages();
+  let idleSince: number | null = null;
+  while (!active.settled && !signal?.aborted && Date.now() < deadline) {
+    if (busy()) {
+      idleSince = null;
+    } else {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= FOLLOW_UP_GRACE_MS) {
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, FOLLOW_UP_POLL_MS));
   }
 }
 
@@ -204,28 +272,40 @@ function turnBudgetMs(claim: WorkspaceTaskClaim, now = Date.now()): number {
  * something.
  */
 function startHeartbeat(
-  claim: WorkspaceTaskClaim,
+  active: ActiveTask,
   signal?: AbortSignal,
-): () => void {
+): { stop: () => void; beatNow: () => void } {
+  const { claim } = active;
   const everyMs = Math.max(15, claim.heartbeat_every_seconds || 120) * 1000;
-  const timer = setInterval(() => {
-    void (async () => {
-      const beat = await heartbeatTask(claim.task_id, signal);
-      if (beat.outcome === "refused") {
-        log.info(
-          { taskId: claim.task_id, reason: beat.reason },
-          "The claim is gone; the turn no longer holds this task",
-        );
-        setActiveTask(null);
-        clearInterval(timer);
-      }
-      // `unavailable` is the network, not a decision. Keep beating: losing
-      // the card because a request timed out would be a worse failure than
-      // the one it protects against.
-    })();
-  }, everyMs);
+  let stopped = false;
+  const beat = async () => {
+    if (stopped) {
+      return;
+    }
+    const result = await heartbeatTask(
+      claim.task_id,
+      signal,
+      active.conversationId,
+    );
+    if (result.outcome === "refused" && !stopped) {
+      log.info(
+        { taskId: claim.task_id, reason: result.reason },
+        "The claim is gone; the turn no longer holds this task",
+      );
+      setActiveTask(null);
+      stop();
+    }
+    // `unavailable` is the network, not a decision. Keep beating: losing
+    // the card because a request timed out would be a worse failure than
+    // the one it protects against.
+  };
+  const timer = setInterval(() => void beat(), everyMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  const stop = () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+  return { stop, beatNow: () => void beat() };
 }
 
 function taskTitle(task: WorkspaceTask): string {

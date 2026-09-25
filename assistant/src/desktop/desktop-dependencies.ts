@@ -60,7 +60,24 @@ export type DesktopSetupStatus = {
   stage?: "packages" | "chrome" | "checking";
 };
 
-export function desktopChromePath(): string {
+/**
+ * Where an image that bakes the desktop (the Aexy fork's Dockerfile) puts the
+ * same pinned Chrome. Checked first, and only trusted once its `.ready`
+ * marker exists, which the image writes after Chrome has run.
+ */
+export const BAKED_DESKTOP_ROOT = "/opt/vellum-desktop";
+
+export function desktopChromePath(
+  bakedRoot: string = BAKED_DESKTOP_ROOT,
+): string {
+  const baked = join(
+    bakedRoot,
+    `chrome-${CHROME_VERSION}`,
+    "opt/google/chrome/chrome",
+  );
+  if (existsSync(baked + ".ready")) {
+    return baked;
+  }
   return join(
     getExternalDir(),
     "desktop",
@@ -243,7 +260,13 @@ async function installDesktopComponents(
     "/usr/bin/apt-get",
     ...(caBundle ? ["-o", `Acquire::https::CaInfo=${caBundle}`] : []),
   ];
-  await rm(desktopChromePath() + ".ready", { force: true });
+  // A baked Chrome is the image's and stays as it is; only the packages can
+  // be missing (a Kata save discarded the root they were installed into).
+  const chromePath = desktopChromePath();
+  const baked = chromePath.startsWith(BAKED_DESKTOP_ROOT + "/");
+  if (!baked) {
+    await rm(chromePath + ".ready", { force: true });
+  }
   // Desktop binaries, X assets and the loader share the image root.
   await run([...apt, "update"]);
   await run([
@@ -258,7 +281,7 @@ async function installDesktopComponents(
     ...DESKTOP_PACKAGES,
   ]);
   onStage("chrome");
-  if (!existsSync(desktopChromePath())) {
+  if (!existsSync(chromePath)) {
     const downloadDir = await mkdtemp(join(tmpdir(), "desktop-chrome-"));
     const installRoot = join(getExternalDir(), "desktop");
     await mkdir(installRoot, { recursive: true });
@@ -299,8 +322,10 @@ async function installDesktopComponents(
     }
   }
   onStage("checking");
-  await run([desktopChromePath(), "--version"]);
-  await writeFile(desktopChromePath() + ".ready", "");
+  await run([chromePath, "--version"]);
+  if (!baked) {
+    await writeFile(chromePath + ".ready", "");
+  }
 }
 
 export const desktopDependencyInstaller = new DesktopDependencyInstaller();
