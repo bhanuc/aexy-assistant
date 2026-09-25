@@ -383,7 +383,7 @@ describe("GET /v1/live/threads", () => {
 
     expect(res!.status).toBe(200);
     expect(daemonCalls[0]!.url.pathname).toBe("/v1/live/threads");
-    expect(daemonCalls[0]!.url.searchParams.get("user")).toBe("all");
+    expect(daemonCalls[0]!.url.searchParams.get("platform_user")).toBe("all");
   });
 });
 
@@ -705,7 +705,8 @@ describe("GET /v1/live/threads for people on the access list", () => {
 
     expect(res!.status).toBe(200);
     const call = daemonCalls[0]!;
-    expect(call.url.searchParams.get("user")).toBe("dev-priya");
+    // The daemon knows threads by platform user; the list says which one.
+    expect(call.url.searchParams.get("platform_user")).toBe("user-priya");
     expect(call.headers.get("x-vellum-acting-user-id")).toBe("user-priya");
   });
 
@@ -727,10 +728,60 @@ describe("GET /v1/live/threads for people on the access list", () => {
     );
 
     expect(res!.status).toBe(200);
-    expect(daemonCalls[0]!.url.searchParams.get("user")).toBe("all");
+    expect(daemonCalls[0]!.url.searchParams.get("platform_user")).toBe("all");
     expect(daemonCalls[0]!.headers.get("x-vellum-acting-user-role")).toBe(
       "manager",
     );
+  });
+
+  test("names each thread's starter in Aexy's terms, and the owner's as nobody's", async () => {
+    daemonReply = () =>
+      Response.json([
+        {
+          conversation_id: "c-p",
+          platform_user_id: "user-priya",
+          title: "Venues",
+          updated_at: "2026-09-25T04:00:00.000Z",
+        },
+        {
+          conversation_id: "c-g",
+          platform_user_id: null,
+          title: null,
+          updated_at: "2026-09-25T03:00:00.000Z",
+        },
+      ]);
+
+    const res = await route(
+      managed("/v1/live/threads?user=all", { userId: "user-arjun" }),
+    );
+
+    expect(await res!.json()).toEqual([
+      {
+        conversation_id: "c-p",
+        aexy_developer_id: "dev-priya",
+        title: "Venues",
+        updated_at: "2026-09-25T04:00:00.000Z",
+      },
+      {
+        conversation_id: "c-g",
+        aexy_developer_id: null,
+        title: null,
+        updated_at: "2026-09-25T03:00:00.000Z",
+      },
+    ]);
+  });
+
+  test("asks for one person by their platform user, and for anyone else as the guardian", async () => {
+    await route(
+      managed("/v1/live/threads?user=dev-priya", { userId: "user-arjun" }),
+    );
+    await route(
+      managed("/v1/live/threads?user=dev-owner", { userId: "user-arjun" }),
+    );
+
+    expect(
+      daemonCalls.map((c) => c.url.searchParams.get("platform_user")),
+    ).toEqual(["user-priya", "guardian"]);
   });
 });
 

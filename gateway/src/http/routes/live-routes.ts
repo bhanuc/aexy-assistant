@@ -18,6 +18,7 @@ import { findVellumGuardian } from "../../auth/guardian-bootstrap.js";
 import type { GatewayConfig } from "../../config.js";
 import {
   conversationOwner,
+  listAccessEntries,
   recordConversationOwner,
   replaceAccessEntries,
   type AccessEntry,
@@ -111,6 +112,12 @@ function badRequest(message: string): Response {
  * ask for anyone's (`all`, or a named developer); a member only ever gets
  * their own, whatever they asked for, and asking for someone else's is a 403
  * rather than a quietly narrowed answer.
+ *
+ * The daemon knows whose a thread is by platform user (it is in the
+ * conversation key, which survives a restart); only the access list knows
+ * which Aexy developer that is. So the daemon is asked by platform user and
+ * its answer is named back in Aexy's terms here. A developer not on the list
+ * is the guardian: the owner is not an entry, and is who is left.
  */
 async function handleThreads(
   req: Request,
@@ -118,26 +125,63 @@ async function handleThreads(
 ): Promise<Response> {
   const auth = await authorizeLiveServiceCall(req, log);
   if (!auth.ok) return auth.response;
-  const params = new URL(req.url).searchParams;
+  const asked = new URL(req.url).searchParams.get("user")?.trim() || null;
   const caller = auth.caller;
+  const entries = listAccessEntries();
+
+  let platformUser: string;
   if (caller.kind === "entry" && !isPrivilegedRole(caller.entry.role)) {
-    const asked = params.get("user")?.trim();
     if (asked && asked !== caller.entry.aexyDeveloperId) {
       return forbidden(
         "threads_not_yours",
         "Only owners, managers and admins may list other people's threads",
       );
     }
-    params.set("user", caller.entry.aexyDeveloperId);
+    platformUser = caller.entry.platformUserId;
+  } else if (!asked || asked === "all") {
+    platformUser = "all";
+  } else {
+    platformUser =
+      entries.find((e) => e.aexyDeveloperId === asked)?.platformUserId ??
+      "guardian";
   }
-  const search = params.toString();
-  return forwardToDaemon(config, {
+
+  const res = await forwardToDaemon(config, {
     method: "GET",
     path: "/v1/live/threads",
-    search: search ? `?${search}` : "",
+    search: `?${new URLSearchParams({ platform_user: platformUser })}`,
     headers: caller.kind === "entry" ? actingUserHeaders(caller.entry) : {},
   });
+  if (res.status >= 400) return res;
+
+  const threads = DaemonThreads.safeParse(await res.json().catch(() => null));
+  if (!threads.success) {
+    log.error({ status: res.status }, "live threads: unreadable daemon answer");
+    return Response.json({ error: "Bad Gateway" }, { status: 502 });
+  }
+  const developerOf = new Map(
+    entries.map((e) => [e.platformUserId, e.aexyDeveloperId]),
+  );
+  return Response.json(
+    threads.data.map((t) => ({
+      conversation_id: t.conversation_id,
+      aexy_developer_id: t.platform_user_id
+        ? (developerOf.get(t.platform_user_id) ?? null)
+        : null,
+      title: t.title,
+      updated_at: t.updated_at,
+    })),
+  );
 }
+
+const DaemonThreads = z.array(
+  z.object({
+    conversation_id: z.string().min(1),
+    platform_user_id: z.string().nullable(),
+    title: z.string().nullable(),
+    updated_at: z.string(),
+  }),
+);
 
 const AccessListBody = z.object({
   entries: z.array(

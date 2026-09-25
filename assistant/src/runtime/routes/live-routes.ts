@@ -13,9 +13,10 @@ import { getDesktopSessionManager } from "../../desktop/desktop-session-manager.
 import { getLiveControl } from "../../live/live-control-runtime.js";
 import { isLiveViewEnabled } from "../../live/live-view-feature.js";
 import type { ScreencastFrame } from "../../live/screencast.js";
+import { listChatThreads, type ThreadsFor } from "../../live/threads.js";
 import { getLiveWatchHub } from "../../live/watch-hub.js";
 import { GATEWAY_PRINCIPALS } from "../auth/route-policy.js";
-import { NotFoundError } from "./errors.js";
+import { BadRequestError, NotFoundError } from "./errors.js";
 import { type RouteDefinition, RouteResponse } from "./types.js";
 
 /** A cast frame this recent is the snapshot; older, a fresh still is taken. */
@@ -120,6 +121,35 @@ export async function handleLiveControlRoute(
   );
 }
 
+/**
+ * `GET /v1/live/threads?platform_user=all|guardian|<id>` (C6): the chat
+ * threads index, by platform user. Only the gateway calls it, and only after
+ * deciding who may see whose; it maps the answer to Aexy developer ids.
+ * Exported for tests.
+ */
+export function handleLiveThreads(
+  platformUser: string | undefined,
+  deps: { enabled?: () => boolean } = {},
+): RouteResponse {
+  const enabled = deps.enabled ?? (() => isLiveViewEnabled());
+  if (!enabled()) {
+    throw new NotFoundError("The live view is not available on this assistant");
+  }
+  const asked = platformUser?.trim();
+  if (!asked) {
+    throw new BadRequestError(
+      "platform_user is required: all, guardian or an id",
+    );
+  }
+  const who: ThreadsFor =
+    asked === "all" || asked === "guardian" ? asked : { platformUserId: asked };
+  return new RouteResponse(
+    JSON.stringify(listChatThreads(who)),
+    { "content-type": "application/json" },
+    200,
+  );
+}
+
 export const ROUTES: RouteDefinition[] = [
   {
     operationId: "live_control",
@@ -149,6 +179,21 @@ export const ROUTES: RouteDefinition[] = [
     tags: ["live"],
     additionalResponses: {
       "204": { description: "No frame exists" },
+      "404": { description: "The live view is off on this assistant" },
+    },
+  },
+  {
+    operationId: "live_threads",
+    endpoint: "live/threads",
+    method: "GET",
+    policy: { requiredScopes: [], allowedPrincipalTypes: GATEWAY_PRINCIPALS },
+    handler: ({ queryParams }) => handleLiveThreads(queryParams?.platform_user),
+    summary: "Chat threads by who started them",
+    description:
+      "Aexy live view (C6): person-facing conversations with the platform user who started each (null for the guardian's), newest first.",
+    tags: ["live"],
+    additionalResponses: {
+      "400": { description: "No platform_user" },
       "404": { description: "The live view is off on this assistant" },
     },
   },
