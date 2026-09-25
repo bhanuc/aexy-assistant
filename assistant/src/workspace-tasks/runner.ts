@@ -30,6 +30,7 @@
  * browser step cannot be relied on to call it.
  */
 
+import { findConversation } from "../daemon/conversation-registry.js";
 import { holdDesktopForClaim } from "../live/desktop-browser.js";
 import { isLiveViewEnabled } from "../live/live-view-feature.js";
 import { runBackgroundJob } from "../runtime/background-job-runner.js";
@@ -128,7 +129,8 @@ async function workClaimedTask(
     : () => {};
 
   try {
-    const timeoutMs = turnBudgetMs(claim);
+    const startedAt = Date.now();
+    const timeoutMs = turnBudgetMs(claim, startedAt);
     log.info(
       { taskId: task.id, claimId: claim.id, timeoutMs },
       "Working a workspace task",
@@ -166,6 +168,10 @@ async function workClaimedTask(
       );
     }
 
+    if (!active.settled) {
+      await awaitFollowUpTurns(active, startedAt + timeoutMs, signal);
+    }
+
     if (active.settled) {
       return { ran: true, taskId: task.id, settled: active.settled };
     }
@@ -193,6 +199,51 @@ async function workClaimedTask(
     heartbeat.stop();
     releaseDesktop();
     setActiveTask(null);
+  }
+}
+
+/** How often the runner looks at a conversation still taking instructions. */
+export const FOLLOW_UP_POLL_MS = 250;
+
+/**
+ * How long a conversation must stay idle, with nothing queued, before the card
+ * is decided. A queued message starts its turn only after the last one is
+ * finalized, so idle for an instant is not idle.
+ */
+export const FOLLOW_UP_GRACE_MS = 1_500;
+
+/**
+ * Let the turns an instruction queued on the card's conversation finish.
+ *
+ * An instruction sent through the live view is queued, not steered: the turn
+ * in flight yields at its next checkpoint and the instruction runs as the next
+ * turn, on the same conversation, still working the same card. Deciding the
+ * card when the first turn ends gives it back just as the agent was told how
+ * to finish it. So wait until the conversation is idle with nothing queued,
+ * the card is settled, or the budget runs out.
+ */
+async function awaitFollowUpTurns(
+  active: ActiveTask,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const conversation = findConversation(active.conversationId);
+  if (!conversation) {
+    return;
+  }
+  const busy = () =>
+    conversation.isProcessing() || conversation.hasQueuedMessages();
+  let idleSince: number | null = null;
+  while (!active.settled && !signal?.aborted && Date.now() < deadline) {
+    if (busy()) {
+      idleSince = null;
+    } else {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= FOLLOW_UP_GRACE_MS) {
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, FOLLOW_UP_POLL_MS));
   }
 }
 

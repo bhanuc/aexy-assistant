@@ -81,6 +81,13 @@ mock.module("../runtime/background-job-runner.js", () => ({
   },
 }));
 
+/** Conversations the registry knows, by id: where a queued instruction runs. */
+let conversations: Record<string, any> = {};
+mock.module("../daemon/conversation-registry.js", () => ({
+  findConversation: (id: string | undefined) =>
+    id ? conversations[id] : undefined,
+}));
+
 const { runNextWorkspaceTask } = await import("./runner.js");
 const { getActiveTask, resetActiveTaskForTest } =
   await import("./active-task.js");
@@ -101,6 +108,7 @@ describe("running the next workspace task", () => {
     jobResult = { ok: true, conversationId: "c1" };
     settleDuringTurn = "submitted";
     connected = true;
+    conversations = {};
     resetActiveTaskForTest();
   });
 
@@ -223,6 +231,41 @@ describe("running the next workspace task", () => {
       { taskId: "task-1", conversationId: "conv-9" },
     ]);
     expect(activeDuringTurn.conversationId).toBe("conv-9");
+  });
+
+  test("an instruction queued mid-card is worked before the card is decided", async () => {
+    // Pause, instruct, resume: the turn in flight yields at its next checkpoint
+    // and the instruction runs as the next turn on the same conversation. That
+    // turn is still working the card, and here it is the one that hands it in.
+    const { markSettled } = await import("./active-task.js");
+    conversationDuringTurn = "conv-9";
+    settleDuringTurn = null;
+    let looks = 0;
+    conversations["conv-9"] = {
+      isProcessing: () => {
+        looks += 1;
+        if (looks === 3) {
+          markSettled("submitted");
+        }
+        return looks < 3;
+      },
+      hasQueuedMessages: () => looks < 2,
+    };
+    const result = await runNextWorkspaceTask();
+    expect(result).toMatchObject({ ran: true, settled: "submitted" });
+    expect(released).toHaveLength(0);
+  });
+
+  test("a conversation left with nothing to do still gives the card back", async () => {
+    conversationDuringTurn = "conv-9";
+    settleDuringTurn = null;
+    conversations["conv-9"] = {
+      isProcessing: () => false,
+      hasQueuedMessages: () => false,
+    };
+    const result = await runNextWorkspaceTask();
+    expect(result).toMatchObject({ ran: true, settled: "released" });
+    expect(released).toHaveLength(1);
   });
 
   test("a pod not connected to a workspace does nothing quietly", async () => {
