@@ -17,6 +17,9 @@
  * is worth trying again.
  */
 
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
+
 import { resolveManagedProxyContext } from "../providers/platform-proxy/context.js";
 import { getLogger } from "../util/logger.js";
 
@@ -132,20 +135,86 @@ function conversationBody(conversationId: string | undefined): string {
     : "{}";
 }
 
-/** Leave a progress note in the card's ordinary activity feed. */
+/**
+ * Leave a progress note in the card's ordinary activity feed.
+ *
+ * `attachmentIds` link files already uploaded under this claim to the note.
+ */
 export async function reportTaskProgress(
   taskId: string,
   note: string,
   spendCents?: number,
   signal?: AbortSignal,
+  attachmentIds?: string[],
 ): Promise<TaskCallResult<unknown>> {
   return call(
     `/v1/tasks/${encodeURIComponent(taskId)}/activity`,
     {
       method: "POST",
-      body: JSON.stringify({ note, spend_cents: spendCents }),
+      body: JSON.stringify({
+        note,
+        spend_cents: spendCents,
+        ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
+      }),
     },
     signal,
+  );
+}
+
+/** A file the workspace accepted onto the card. */
+export interface UploadedTaskAttachment {
+  id: string;
+  file_name: string;
+  content_type: string | null;
+  file_size: number | null;
+  url: string;
+}
+
+/** The workspace's per-file limit; checked here so nothing oversized is sent. */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** Uploads are bigger than a JSON note, so they get longer than a note does. */
+const UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * Put a file from the sandbox on the card, as the pod's deliverable.
+ *
+ * `filePath` must already be a vetted, resolved path — the sandbox boundary is
+ * enforced by the caller (`attachments.ts`), not here.
+ */
+export async function uploadTaskAttachment(
+  taskId: string,
+  filePath: string,
+  note?: string,
+  signal?: AbortSignal,
+): Promise<TaskCallResult<UploadedTaskAttachment>> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(filePath);
+  } catch (error) {
+    return {
+      outcome: "refused",
+      reason: `the file could not be read: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+    return {
+      outcome: "refused",
+      reason: `the file is larger than ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB`,
+    };
+  }
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(bytes)]), basename(filePath));
+  if (note?.trim()) {
+    form.append("note", note.trim().slice(0, 2000));
+  }
+  return call<UploadedTaskAttachment>(
+    `/v1/tasks/${encodeURIComponent(taskId)}/attachments`,
+    { method: "POST", body: form },
+    signal,
+    UPLOAD_TIMEOUT_MS,
   );
 }
 
@@ -160,10 +229,17 @@ export async function submitTask(
   taskId: string,
   summary: string,
   signal?: AbortSignal,
+  attachmentIds?: string[],
 ): Promise<TaskCallResult<WorkspaceTaskClaim>> {
   return call<WorkspaceTaskClaim>(
     `/v1/tasks/${encodeURIComponent(taskId)}/submit`,
-    { method: "POST", body: JSON.stringify({ summary }) },
+    {
+      method: "POST",
+      body: JSON.stringify({
+        summary,
+        ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
+      }),
+    },
     signal,
   );
 }
@@ -185,6 +261,7 @@ async function call<T>(
   path: string,
   init: RequestInit,
   signal?: AbortSignal,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<TaskCallResult<T>> {
   const { platformBaseUrl, assistantApiKey, enabled } =
     await resolveManagedProxyContext();
@@ -196,14 +273,17 @@ async function call<T>(
   }
 
   const timer = new AbortController();
-  const timeout = setTimeout(() => timer.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => timer.abort(), timeoutMs);
   const onAbort = () => timer.abort();
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const response = await fetch(`${platformBaseUrl}${path}`, {
       ...init,
       headers: {
-        "content-type": "application/json",
+        // A multipart body carries its own content type, with the boundary.
+        ...(init.body instanceof FormData
+          ? {}
+          : { "content-type": "application/json" }),
         authorization: `Bearer ${assistantApiKey}`,
       },
       signal: timer.signal,
@@ -242,10 +322,14 @@ async function call<T>(
 async function refusalText(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as {
-      detail?: string;
+      detail?: string | { code?: string; message?: string };
       message?: string;
     };
-    const text = body?.detail ?? body?.message;
+    const detail = body?.detail;
+    const text =
+      typeof detail === "object" && detail !== null
+        ? (detail.message ?? detail.code)
+        : (detail ?? body?.message);
     if (typeof text === "string" && text.trim()) {
       return text.trim();
     }

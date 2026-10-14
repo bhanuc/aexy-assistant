@@ -25,6 +25,12 @@ export interface ActiveTask {
    * the workspace on heartbeats (C8) and followed by the live view.
    */
   conversationId?: string;
+  /** Files uploaded to the card during this claim, in order. */
+  uploads?: { id: string; fileName: string }[];
+  /** Consecutive failures per tool name, for the broken-tool note. */
+  toolFailures?: Map<string, number>;
+  /** Tools already noted as failing on this claim: one note each. */
+  brokenToolsNoted?: Set<string>;
 }
 
 let active: ActiveTask | null = null;

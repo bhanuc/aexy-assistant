@@ -12,6 +12,7 @@ import {
   rememberTool,
 } from "../plugins/defaults/memory/tools.js";
 import {
+  attachTaskFileTool,
   releaseTaskTool,
   reportTaskProgressTool,
   submitTaskTool,
@@ -78,6 +79,7 @@ export const explicitTools: ToolDefinition[] = [
   // a sentence saying there is no task, which is clearer than a tool that
   // appears and disappears.
   reportTaskProgressTool,
+  attachTaskFileTool,
   submitTaskTool,
   releaseTaskTool,
   reactToMessageTool,

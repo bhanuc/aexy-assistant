@@ -17,7 +17,9 @@ const heartbeats: any[] = [];
 let conversationDuringTurn: string | null = null;
 let activeDuringTurn: any = null;
 const released: any[] = [];
+const progressPosts: any[] = [];
 let jobCalls: any[] = [];
+let turnHook: (() => Promise<void>) | null = null;
 let jobResult: any = { ok: true, conversationId: "c1" };
 /** Set by the fake job to simulate the turn calling submit_task. */
 let settleDuringTurn: "submitted" | "released" | null = null;
@@ -62,7 +64,12 @@ mock.module("./client.js", () => ({
     return Promise.resolve({ outcome: "ok", value: CLAIM });
   },
   submitTask: () => Promise.resolve({ outcome: "ok", value: CLAIM }),
-  reportTaskProgress: () => Promise.resolve({ outcome: "ok", value: {} }),
+  reportTaskProgress: (taskId: string, note: string) => {
+    progressPosts.push({ taskId, note });
+    return Promise.resolve({ outcome: "ok", value: {} });
+  },
+  MAX_ATTACHMENT_BYTES: 25 * 1024 * 1024,
+  uploadTaskAttachment: () => Promise.reject(new Error("not used")),
 }));
 
 mock.module("../runtime/background-job-runner.js", () => ({
@@ -73,6 +80,7 @@ mock.module("../runtime/background-job-runner.js", () => ({
       const { getActiveTask } = await import("./active-task.js");
       activeDuringTurn = { ...getActiveTask() };
     }
+    await turnHook?.();
     if (settleDuringTurn) {
       const { markSettled } = await import("./active-task.js");
       markSettled(settleDuringTurn);
@@ -101,10 +109,12 @@ describe("running the next workspace task", () => {
     claimResult = { outcome: "ok", value: CLAIM };
     heartbeatResult = { outcome: "ok", value: CLAIM };
     released.length = 0;
+    progressPosts.length = 0;
     heartbeats.length = 0;
     conversationDuringTurn = null;
     activeDuringTurn = null;
     jobCalls = [];
+    turnHook = null;
     jobResult = { ok: true, conversationId: "c1" };
     settleDuringTurn = "submitted";
     connected = true;
@@ -266,6 +276,55 @@ describe("running the next workspace task", () => {
     const result = await runNextWorkspaceTask();
     expect(result).toMatchObject({ ran: true, settled: "released" });
     expect(released).toHaveLength(1);
+  });
+
+  test("the prompt says a sandbox file is not a deliverable", async () => {
+    await runNextWorkspaceTask();
+    const postamble = jobCalls[0].assistantSandwich.postamble;
+    expect(postamble).toContain("A file in your sandbox is not a deliverable");
+    expect(postamble).toContain("attach_task_file");
+  });
+
+  test("a tool failing three times in a row is noted once per claim", async () => {
+    const { assistantEventHub } =
+      await import("../runtime/assistant-event-hub.js");
+    conversationDuringTurn = "conv-fail";
+    const result = (toolName: string, isError: boolean) =>
+      assistantEventHub.publish({
+        message: {
+          type: "tool_result",
+          toolName,
+          result: "ECONNRESET talking to the site\nstack trace",
+          isError,
+          conversationId: "conv-fail",
+        } as any,
+        conversationId: "conv-fail",
+      } as any);
+    settleDuringTurn = null;
+    jobResult = { ok: true, conversationId: "conv-fail" };
+    conversations["conv-fail"] = {
+      isProcessing: () => false,
+      hasQueuedMessages: () => false,
+    };
+    turnHook = async () => {
+      await result("web_fetch", true);
+      await result("web_fetch", true);
+      await result("web_fetch", false); // a success resets the streak
+      await result("web_fetch", true);
+      await result("web_fetch", true);
+      expect(progressPosts).toHaveLength(0);
+      await result("web_fetch", true);
+      await result("web_fetch", true);
+      await result("web_fetch", true);
+      await result("browser", true);
+    };
+    await runNextWorkspaceTask();
+    expect(progressPosts).toEqual([
+      {
+        taskId: "task-1",
+        note: "web_fetch is failing (ECONNRESET talking to the site); working around it.",
+      },
+    ]);
   });
 
   test("a pod not connected to a workspace does nothing quietly", async () => {
