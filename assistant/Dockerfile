@@ -158,6 +158,9 @@ COPY packages/slack-text /app/packages/slack-text
 COPY packages/twilio-client /app/packages/twilio-client
 
 COPY assistant /app/assistant
+# The flag registry (assistant-feature-flags.ts reads <root>/meta/feature-flags):
+# a key it does not declare resolves to off, whatever the platform pushes.
+COPY meta/feature-flags /app/meta/feature-flags
 
 # Resolve production workspace dependencies from the filesystem layout shipped
 # in the image.
