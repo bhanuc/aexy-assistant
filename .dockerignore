@@ -44,6 +44,9 @@ clients/macos/src
 !gateway/**
 !packages/
 !packages/**
+# The feature flag registry: the gateway and the daemon resolve a key it does
+# not declare to off, so an image without it has every flag dead.
+!meta/feature-flags/feature-flag-registry.json
 !skills/
 # Shared category taxonomy: the daemon reads this synchronously to normalize
 # plugin marketplace categories without a remote fetch (see

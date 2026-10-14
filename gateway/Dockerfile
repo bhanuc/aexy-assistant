@@ -58,6 +58,9 @@ COPY --chown=gateway:gateway packages/service-contracts /app/packages/service-co
 COPY --chown=gateway:gateway packages/slack-text /app/packages/slack-text
 COPY --chown=gateway:gateway packages/twilio-client /app/packages/twilio-client
 COPY --chown=gateway:gateway gateway /app/gateway
+# The flag registry: a key it does not declare resolves to off, whatever the
+# platform pushes (feature-flag-resolver.ts), so without it every flag is dead.
+COPY --chown=gateway:gateway meta/feature-flags /app/meta/feature-flags
 
 RUN ln -sf /app/gateway/src/cli/index.ts /usr/local/bin/gateway \
     && chmod +x /app/gateway/src/cli/index.ts
