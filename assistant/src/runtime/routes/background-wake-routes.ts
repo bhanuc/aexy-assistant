@@ -13,6 +13,7 @@ import {
   type SchedulerHandle,
 } from "../../schedule/scheduler.js";
 import { getLogger } from "../../util/logger.js";
+import { runNextWorkspaceTask } from "../../workspace-tasks/runner.js";
 import { GATEWAY_PRINCIPALS } from "../auth/route-policy.js";
 import { BadRequestError, ServiceUnavailableError } from "./errors.js";
 import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
@@ -20,7 +21,8 @@ import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
 /** The scheduler and heartbeat surface the drain-due lease needs. */
 type BackgroundWakeRuntime = {
   scheduler: Pick<SchedulerHandle, "runOnce" | "runDueWorkOnce">;
-  heartbeat: Pick<HeartbeatService, "nextRunAt" | "runManagedWakeIfDue">;
+  heartbeat: Pick<HeartbeatService, "nextRunAt" | "runManagedWakeIfDue"> &
+    Partial<Pick<HeartbeatService, "isRunInFlight">>;
 };
 
 const PREPARE_SLEEP_DEFER_WINDOW_MS = 60_000;
@@ -232,6 +234,29 @@ async function performDrainDue(
   request: DrainDueRequest,
   runtime: BackgroundWakeRuntime,
 ) {
+  // A wake asked for because a card was assigned reads the board directly.
+  // The heartbeat is the other caller of runNextWorkspaceTask, but a freshly
+  // woken pod restarts its timer, so waiting for it would never read the
+  // queue. A pod runs one browser, so if a heartbeat turn is already in
+  // flight, skip: that turn reads the queue first and picks the card up.
+  if (
+    reasonIncludesSource(request.reason, "workspace_task") &&
+    hasStartBudget(request.deadlineAt)
+  ) {
+    if (runtime.heartbeat.isRunInFlight) {
+      log.debug("Heartbeat turn in flight; leaving the task queue to it");
+    } else {
+      try {
+        const taskRun = await runNextWorkspaceTask();
+        if (!taskRun.ran) {
+          log.debug({ reason: taskRun.reason }, "No workspace task on wake");
+        }
+      } catch (err) {
+        log.warn({ err }, "Workspace task run failed during background wake");
+      }
+    }
+  }
+
   const now = Date.now();
   const currentIntent = computeWakeIntent(now);
   const heartbeatDue = isHeartbeatTimerDue(runtime.heartbeat.nextRunAt, now);
@@ -276,8 +301,13 @@ function completionStatusForError(error: unknown): "failed" | "expired" {
 
 function reasonIncludesSource(
   reason: string,
-  source: "heartbeat" | "schedule",
+  source: "heartbeat" | "schedule" | "workspace_task",
 ): boolean {
+  // "mixed" is the heartbeat/schedule pair; a task wake is only ever named
+  // outright, so a heartbeat-only drain never reads the queue.
+  if (source === "workspace_task") {
+    return reason === source;
+  }
   return reason === "mixed" || reason === source;
 }
 

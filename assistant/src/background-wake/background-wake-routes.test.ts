@@ -27,6 +27,14 @@ mock.module("../heartbeat/heartbeat-service.js", () => ({
   HeartbeatService: { getInstance: () => mockHeartbeat },
 }));
 
+const mockRunNextWorkspaceTask = mock(async () => ({
+  ran: false as const,
+  reason: "nothing assigned",
+}));
+mock.module("../workspace-tasks/runner.js", () => ({
+  runNextWorkspaceTask: mockRunNextWorkspaceTask,
+}));
+
 function setBackgroundWakeRuntime(runtime: BackgroundWakeRuntime): void {
   mockScheduler = runtime.scheduler;
   mockHeartbeat = runtime.heartbeat;
@@ -129,6 +137,7 @@ describe("background wake runtime routes", () => {
   beforeEach(() => {
     clearBackgroundWakeRuntime();
     mockRenewBackgroundWakeLease.mockClear();
+    mockRunNextWorkspaceTask.mockClear();
     mockCompleteBackgroundWakeLease.mockClear();
     mockRenewBackgroundWakeLease.mockImplementation(
       async (_leaseId: string) => ({
@@ -283,6 +292,103 @@ describe("background wake runtime routes", () => {
       leaseId: "lease-123",
       status: "completed",
     });
+  });
+
+  function taskWakeRuntime(extra: { isRunInFlight?: boolean } = {}) {
+    setBackgroundWakeRuntime({
+      heartbeat: {
+        nextRunAt: Date.now() + 5 * 60_000,
+        runManagedWakeIfDue: mock(async () => ({
+          due: true,
+          completed: 1,
+          skipped: 0,
+        })),
+        ...extra,
+      },
+      scheduler: {
+        runOnce: mock(async () => 0),
+        runDueWorkOnce: mock(async () => schedulerResultFixture()),
+      },
+    });
+  }
+
+  test("drain-due reads the task queue once on a workspace_task wake", async () => {
+    taskWakeRuntime();
+    const handler = findHandler("drainDueBackgroundWake");
+
+    await handler({
+      body: drainBodyFixture({
+        reason: "workspace_task",
+        deadlineAt: Date.now() + 60_000,
+      }),
+    });
+    await flushBackgroundWakeDrainsForTest();
+
+    expect(mockRunNextWorkspaceTask).toHaveBeenCalledTimes(1);
+    expect(lastCompletionPayload().status).toBe("completed");
+  });
+
+  test("drain-due does not read the task queue on a heartbeat-only wake", async () => {
+    taskWakeRuntime();
+    const handler = findHandler("drainDueBackgroundWake");
+
+    await handler({
+      body: drainBodyFixture({
+        reason: "heartbeat",
+        deadlineAt: Date.now() + 60_000,
+      }),
+    });
+    await flushBackgroundWakeDrainsForTest();
+
+    expect(mockRunNextWorkspaceTask).not.toHaveBeenCalled();
+  });
+
+  test("drain-due skips the task queue without a start budget", async () => {
+    taskWakeRuntime();
+    const handler = findHandler("drainDueBackgroundWake");
+
+    await handler({
+      body: drainBodyFixture({
+        reason: "workspace_task",
+        deadlineAt: Date.now() + 2_000,
+      }),
+    });
+    await flushBackgroundWakeDrainsForTest();
+
+    expect(mockRunNextWorkspaceTask).not.toHaveBeenCalled();
+  });
+
+  test("drain-due leaves the queue to a heartbeat turn already in flight", async () => {
+    taskWakeRuntime({ isRunInFlight: true });
+    const handler = findHandler("drainDueBackgroundWake");
+
+    await handler({
+      body: drainBodyFixture({
+        reason: "workspace_task",
+        deadlineAt: Date.now() + 60_000,
+      }),
+    });
+    await flushBackgroundWakeDrainsForTest();
+
+    expect(mockRunNextWorkspaceTask).not.toHaveBeenCalled();
+  });
+
+  test("drain-due still completes the lease when the task runner throws", async () => {
+    taskWakeRuntime();
+    mockRunNextWorkspaceTask.mockImplementationOnce(async () => {
+      throw new Error("boom");
+    });
+    const handler = findHandler("drainDueBackgroundWake");
+
+    await handler({
+      body: drainBodyFixture({
+        reason: "workspace_task",
+        deadlineAt: Date.now() + 60_000,
+      }),
+    });
+    await flushBackgroundWakeDrainsForTest();
+
+    expect(lastCompletionPayload().status).toBe("completed");
   });
 
   test("drain-due recomputes the next intent after due work drains", async () => {
