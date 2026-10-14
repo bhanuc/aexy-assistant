@@ -214,6 +214,11 @@ export class HeartbeatService {
     );
   }
 
+  /** Whether a heartbeat turn is executing right now. */
+  get isRunInFlight(): boolean {
+    return this.activeRun != null;
+  }
+
   /** Whether the daily run cap has been reached. */
   get isDailyCapReached(): boolean {
     const config = getConfig().heartbeat;
