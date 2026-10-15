@@ -132,20 +132,80 @@ function conversationBody(conversationId: string | undefined): string {
     : "{}";
 }
 
-/** Leave a progress note in the card's ordinary activity feed. */
+/**
+ * Leave a progress note in the card's ordinary activity feed.
+ *
+ * `attachmentIds` link files already uploaded under this claim to the note.
+ */
 export async function reportTaskProgress(
   taskId: string,
   note: string,
   spendCents?: number,
   signal?: AbortSignal,
+  attachmentIds?: string[],
 ): Promise<TaskCallResult<unknown>> {
   return call(
     `/v1/tasks/${encodeURIComponent(taskId)}/activity`,
     {
       method: "POST",
-      body: JSON.stringify({ note, spend_cents: spendCents }),
+      body: JSON.stringify({
+        note,
+        spend_cents: spendCents,
+        ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
+      }),
     },
     signal,
+  );
+}
+
+/** A file the workspace accepted onto the card. */
+export interface UploadedTaskAttachment {
+  id: string;
+  file_name: string;
+  content_type: string | null;
+  file_size: number | null;
+  url: string;
+}
+
+/** The workspace's per-file limit; checked here so nothing oversized is sent. */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** Uploads are bigger than a JSON note, so they get longer than a note does. */
+const UPLOAD_TIMEOUT_MS = 120_000;
+
+/**
+ * Put a file from the sandbox on the card, as the pod's deliverable.
+ *
+ * Takes the bytes, not a path. The caller (`attachments.ts`) opened and vetted
+ * the file descriptor the bytes came from; reading the path again here would
+ * reopen the window between the check and the read that it closes.
+ */
+export async function uploadTaskAttachment(
+  taskId: string,
+  bytes: Buffer<ArrayBuffer>,
+  fileName: string,
+  note?: string,
+  signal?: AbortSignal,
+): Promise<TaskCallResult<UploadedTaskAttachment>> {
+  if (bytes.byteLength === 0) {
+    return { outcome: "refused", reason: "the file is empty" };
+  }
+  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+    return {
+      outcome: "refused",
+      reason: `the file is larger than ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB`,
+    };
+  }
+  const form = new FormData();
+  form.append("file", new Blob([bytes]), fileName);
+  if (note?.trim()) {
+    form.append("note", note.trim().slice(0, 2000));
+  }
+  return call<UploadedTaskAttachment>(
+    `/v1/tasks/${encodeURIComponent(taskId)}/attachments`,
+    { method: "POST", body: form },
+    signal,
+    UPLOAD_TIMEOUT_MS,
   );
 }
 
@@ -160,10 +220,17 @@ export async function submitTask(
   taskId: string,
   summary: string,
   signal?: AbortSignal,
+  attachmentIds?: string[],
 ): Promise<TaskCallResult<WorkspaceTaskClaim>> {
   return call<WorkspaceTaskClaim>(
     `/v1/tasks/${encodeURIComponent(taskId)}/submit`,
-    { method: "POST", body: JSON.stringify({ summary }) },
+    {
+      method: "POST",
+      body: JSON.stringify({
+        summary,
+        ...(attachmentIds?.length ? { attachment_ids: attachmentIds } : {}),
+      }),
+    },
     signal,
   );
 }
@@ -181,11 +248,68 @@ export async function releaseTask(
   );
 }
 
+/** Longest a `Retry-After` is honoured, and how many times it is followed. */
+const MAX_RETRY_AFTER_MS = 10_000;
+const MAX_RATE_LIMIT_RETRIES = 2;
+
+/** `Retry-After` in milliseconds (seconds form only), capped. */
+function retryAfterMs(response: Response): number {
+  const seconds = Number(response.headers.get("retry-after"));
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return 1_000;
+  }
+  return Math.min(seconds * 1_000, MAX_RETRY_AFTER_MS);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * One call, following the platform's 429s: wait what it asked (capped) and
+ * try again, twice at most. A 429 means the request was not processed, so
+ * repeating it cannot duplicate anything.
+ */
 async function call<T>(
   path: string,
   init: RequestInit,
   signal?: AbortSignal,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<TaskCallResult<T>> {
+  let result = await callOnce<T>(path, init, signal, timeoutMs);
+  for (
+    let attempt = 0;
+    attempt < MAX_RATE_LIMIT_RETRIES && result.rateLimitedForMs !== undefined;
+    attempt++
+  ) {
+    await sleep(result.rateLimitedForMs, signal);
+    if (signal?.aborted) {
+      break;
+    }
+    result = await callOnce<T>(path, init, signal, timeoutMs);
+  }
+  const { rateLimitedForMs: _unused, ...settled } = result;
+  return settled as TaskCallResult<T>;
+}
+
+async function callOnce<T>(
+  path: string,
+  init: RequestInit,
+  signal?: AbortSignal,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<TaskCallResult<T> & { rateLimitedForMs?: number }> {
   const { platformBaseUrl, assistantApiKey, enabled } =
     await resolveManagedProxyContext();
   if (!enabled) {
@@ -196,14 +320,17 @@ async function call<T>(
   }
 
   const timer = new AbortController();
-  const timeout = setTimeout(() => timer.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => timer.abort(), timeoutMs);
   const onAbort = () => timer.abort();
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const response = await fetch(`${platformBaseUrl}${path}`, {
       ...init,
       headers: {
-        "content-type": "application/json",
+        // A multipart body carries its own content type, with the boundary.
+        ...(init.body instanceof FormData
+          ? {}
+          : { "content-type": "application/json" }),
         authorization: `Bearer ${assistantApiKey}`,
       },
       signal: timer.signal,
@@ -218,6 +345,9 @@ async function call<T>(
       return {
         outcome: "refused",
         reason: await refusalText(response),
+        ...(response.status === 429
+          ? { rateLimitedForMs: retryAfterMs(response) }
+          : {}),
       };
     }
     return {
@@ -242,10 +372,14 @@ async function call<T>(
 async function refusalText(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as {
-      detail?: string;
+      detail?: string | { code?: string; message?: string };
       message?: string;
     };
-    const text = body?.detail ?? body?.message;
+    const detail = body?.detail;
+    const text =
+      typeof detail === "object" && detail !== null
+        ? (detail.message ?? detail.code)
+        : (detail ?? body?.message);
     if (typeof text === "string" && text.trim()) {
       return text.trim();
     }

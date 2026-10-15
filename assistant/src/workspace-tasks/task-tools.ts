@@ -18,13 +18,28 @@ import {
   invalidToolInputResult,
   toToolInputSchema,
 } from "../tools/shared/zod-tool-schema.js";
-import type { ToolDefinition, ToolExecutionResult } from "../tools/types.js";
+import type {
+  ToolContext,
+  ToolDefinition,
+  ToolExecutionResult,
+} from "../tools/types.js";
 import { getActiveTask, markSettled } from "./active-task.js";
+import { attachFile, attachFiles, unattachedMentions } from "./attachments.js";
 import { releaseTask, reportTaskProgress, submitTask } from "./client.js";
 
 const NO_TASK =
   "You are not working on a workspace task right now, so there is nothing " +
   "to report against.";
+
+const attachmentsField = z
+  .array(z.string().min(1))
+  .max(20)
+  .optional()
+  .describe(
+    "Paths of files you produced for this card (relative to your workspace, " +
+      "or absolute inside it). Each is uploaded to the card first; a file " +
+      "in your sandbox is not a deliverable until it is attached.",
+  );
 
 const progressSchema = z.looseObject({
   note: z
@@ -36,6 +51,22 @@ const progressSchema = z.looseObject({
         "the card's activity feed where the person who assigned it will " +
         "read it, so write it for them rather than for yourself.",
     ),
+  attachments: attachmentsField,
+});
+
+const attachSchema = z.looseObject({
+  path: z
+    .string()
+    .min(1)
+    .describe(
+      "The file to attach: a path inside your workspace, relative to it or " +
+        "absolute. One file; directories are refused. 25 MB at most.",
+    ),
+  note: z
+    .string()
+    .max(2000)
+    .optional()
+    .describe("Optional one-line description of what the file is."),
 });
 
 const submitSchema = z.looseObject({
@@ -48,6 +79,14 @@ const submitSchema = z.looseObject({
         "check. The card goes to a review column rather than to done — a " +
         "person verifies this before it counts as finished — so say what " +
         "would let them verify it quickly.",
+    ),
+  attachments: attachmentsField,
+  confirm_no_attachments: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true only when your summary names a file you deliberately are " +
+        "not attaching, and the summary says why.",
     ),
 });
 
@@ -75,7 +114,10 @@ export const reportTaskProgressTool = {
   defaultRiskLevel: RiskLevel.Low,
   input_schema: toToolInputSchema(progressSchema),
 
-  async execute(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+  async execute(
+    input: Record<string, unknown>,
+    context?: ToolContext,
+  ): Promise<ToolExecutionResult> {
     const parsed = progressSchema.safeParse(input);
     if (!parsed.success) {
       return invalidToolInputResult("report_task_progress", parsed.error);
@@ -84,9 +126,24 @@ export const reportTaskProgressTool = {
     if (!active) {
       return { content: NO_TASK, isError: true };
     }
+    let attachmentIds: string[] | undefined;
+    if (parsed.data.attachments?.length) {
+      const uploaded = await attachFiles(
+        active,
+        parsed.data.attachments,
+        context?.workingDir,
+      );
+      if (!uploaded.ok) {
+        return { content: uploaded.error, isError: true };
+      }
+      attachmentIds = uploaded.ids;
+    }
     const result = await reportTaskProgress(
       active.claim.task_id,
       parsed.data.note,
+      undefined,
+      undefined,
+      attachmentIds,
     );
     if (result.outcome === "ok") {
       return { content: "Noted on the card.", isError: false };
@@ -116,7 +173,10 @@ export const submitTaskTool = {
   defaultRiskLevel: RiskLevel.Low,
   input_schema: toToolInputSchema(submitSchema),
 
-  async execute(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+  async execute(
+    input: Record<string, unknown>,
+    context?: ToolContext,
+  ): Promise<ToolExecutionResult> {
     const parsed = submitSchema.safeParse(input);
     if (!parsed.success) {
       return invalidToolInputResult("submit_task", parsed.error);
@@ -125,7 +185,42 @@ export const submitTaskTool = {
     if (!active) {
       return { content: NO_TASK, isError: true };
     }
-    const result = await submitTask(active.claim.task_id, parsed.data.summary);
+    let attachmentIds: string[] | undefined;
+    if (parsed.data.attachments?.length) {
+      const uploaded = await attachFiles(
+        active,
+        parsed.data.attachments,
+        context?.workingDir,
+      );
+      if (!uploaded.ok) {
+        // Nothing is submitted: a hand-in without its files is the thing
+        // this guards against.
+        return { content: uploaded.error, isError: true };
+      }
+      attachmentIds = uploaded.ids;
+    }
+    const unattached = parsed.data.confirm_no_attachments
+      ? []
+      : unattachedMentions(parsed.data.summary, active, context?.workingDir);
+    if (unattached.length) {
+      return {
+        content:
+          `Your summary mentions ${unattached.map((n) => `"${n}"`).join(", ")} ` +
+          "but it was not attached to " +
+          "this card. A file in your sandbox is not a deliverable; nobody " +
+          "can open it. Attach it (attach_task_file, or the attachments " +
+          "field here) and submit again — or, if you really are not " +
+          "delivering a file, say why in the summary and submit with " +
+          "confirm_no_attachments: true. Nothing was submitted.",
+        isError: true,
+      };
+    }
+    const result = await submitTask(
+      active.claim.task_id,
+      parsed.data.summary,
+      undefined,
+      attachmentIds,
+    );
     if (result.outcome === "ok") {
       markSettled("submitted");
       return {
@@ -141,6 +236,55 @@ export const submitTaskTool = {
           ? `This task could not be handed in: ${result.reason}`
           : `The workspace could not be reached: ${result.reason}`,
       isError: true,
+    };
+  },
+} satisfies ToolDefinition;
+
+export const attachTaskFileTool = {
+  name: "attach_task_file",
+  description:
+    "Upload a file from your workspace to the workspace task you are working " +
+    "on, so the person who assigned it can open it. A file in your sandbox " +
+    "is not a deliverable until it is attached. Use it for every report, " +
+    "document, spreadsheet or image you produced for this card. Returns the " +
+    "attachment id.",
+  category: "interaction",
+  executionTarget: "sandbox",
+  // Medium, not Low like the other task tools: this one moves a file out of
+  // the pod to a place other people read. The sandbox boundary keeps it to
+  // the workspace, but a workspace holds things a prompt-injected card
+  // should not be able to publish unreviewed (fetched pages, credentials a
+  // script wrote), so it sits behind the same approval threshold as
+  // host_file transfer rather than being a free pass.
+  defaultRiskLevel: RiskLevel.Medium,
+  input_schema: toToolInputSchema(attachSchema),
+
+  async execute(
+    input: Record<string, unknown>,
+    context?: ToolContext,
+  ): Promise<ToolExecutionResult> {
+    const parsed = attachSchema.safeParse(input);
+    if (!parsed.success) {
+      return invalidToolInputResult("attach_task_file", parsed.error);
+    }
+    const active = getActiveTask();
+    if (!active) {
+      return { content: NO_TASK, isError: true };
+    }
+    const outcome = await attachFile(
+      active,
+      parsed.data.path,
+      parsed.data.note,
+      context?.workingDir,
+    );
+    if (!outcome.ok) {
+      return { content: outcome.error, isError: true };
+    }
+    return {
+      content:
+        `${outcome.reused ? "Already attached: " : "Attached "}${outcome.attachment.file_name} to the card ` +
+        `(attachment id ${outcome.attachment.id}).`,
+      isError: false,
     };
   },
 } satisfies ToolDefinition;
@@ -187,9 +331,10 @@ export const releaseTaskTool = {
   },
 } satisfies ToolDefinition;
 
-/** The three tools a working turn is given, and nothing else new. */
+/** The tools a working turn is given, and nothing else new. */
 export const WORKSPACE_TASK_TOOLS = [
   reportTaskProgressTool,
+  attachTaskFileTool,
   submitTaskTool,
   releaseTaskTool,
 ] as const;

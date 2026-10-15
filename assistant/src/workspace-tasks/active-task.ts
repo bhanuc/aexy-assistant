@@ -13,18 +13,35 @@
  * that could name the card could submit somebody else's.
  */
 
-import type { WorkspaceTask, WorkspaceTaskClaim } from "./client.js";
+import type {
+  UploadedTaskAttachment,
+  WorkspaceTask,
+  WorkspaceTaskClaim,
+} from "./client.js";
 
 export interface ActiveTask {
   task: WorkspaceTask;
   claim: WorkspaceTaskClaim;
   /** Set by the task tools so the runner knows the turn settled itself. */
   settled: "submitted" | "released" | null;
+  /** When this process started the claim (ms); bounds inline attachments. */
+  startedAt?: number;
   /**
    * The conversation working the card, once the turn has one. Reported to
    * the workspace on heartbeats (C8) and followed by the live view.
    */
   conversationId?: string;
+  /** Files uploaded to the card during this claim, in order. */
+  uploads?: { id: string; fileName: string; realPath?: string }[];
+  /**
+   * Uploads by file identity (dev, inode, size, mtime), so the same file
+   * attached twice, or re-sent after a lost answer, is one attachment.
+   */
+  uploadsByIdentity?: Map<string, UploadedTaskAttachment>;
+  /** Consecutive failures per tool name, for the broken-tool note. */
+  toolFailures?: Map<string, number>;
+  /** Tools already noted as failing on this claim: one note each. */
+  brokenToolsNoted?: Set<string>;
 }
 
 let active: ActiveTask | null = null;

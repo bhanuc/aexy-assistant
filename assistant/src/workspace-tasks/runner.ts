@@ -33,6 +33,7 @@
 import { findConversation } from "../daemon/conversation-registry.js";
 import { holdDesktopForClaim } from "../live/desktop-browser.js";
 import { isLiveViewEnabled } from "../live/live-view-feature.js";
+import { assistantEventHub } from "../runtime/assistant-event-hub.js";
 import { runBackgroundJob } from "../runtime/background-job-runner.js";
 import { wrapUntrustedContent } from "../security/untrusted-content.js";
 import { getLogger } from "../util/logger.js";
@@ -48,9 +49,14 @@ import {
   heartbeatTask,
   readTaskQueue,
   releaseTask,
+  reportTaskProgress,
   type WorkspaceTask,
   type WorkspaceTaskClaim,
 } from "./client.js";
+import {
+  observeToolResult,
+  releaseBrokenToolNote,
+} from "./tool-failure-note.js";
 
 const log = getLogger("workspace-tasks-runner");
 
@@ -118,12 +124,18 @@ async function workClaimedTask(
   claim: WorkspaceTaskClaim,
   signal?: AbortSignal,
 ): Promise<TaskRunOutcome> {
-  const active: ActiveTask = { task, claim, settled: null };
+  const active: ActiveTask = {
+    task,
+    claim,
+    settled: null,
+    startedAt: Date.now(),
+  };
   setActiveTask(active);
   const heartbeat = startHeartbeat(active, signal);
   // Under the live view the desktop the agent browses on stays up for the
   // whole claim, not just the linger after its last browser call, so the page
   // it left is still there for whoever opens the watch view mid-task.
+  const watchTools: { current?: { dispose(): void } } = {};
   const releaseDesktop = isLiveViewEnabled()
     ? holdDesktopForClaim(claim.id)
     : () => {};
@@ -153,6 +165,10 @@ async function workClaimedTask(
       onConversationCreated: (conversationId) => {
         setActiveTaskConversation(conversationId);
         heartbeat.beatNow();
+        // A second conversation for the same claim replaces the first
+        // watcher; the old subscription must not outlive it.
+        watchTools.current?.dispose();
+        watchTools.current = watchToolFailures(active, conversationId);
       },
       assistantSandwich: {
         preamble: PREAMBLE,
@@ -197,9 +213,63 @@ async function workClaimedTask(
     return { ran: true, taskId: task.id, settled: "released" };
   } finally {
     heartbeat.stop();
+    watchTools.current?.dispose();
     releaseDesktop();
     setActiveTask(null);
   }
+}
+
+/**
+ * Post the one-line note when a tool keeps failing on this claim.
+ *
+ * Watches the conversation's `tool_result` events on the in-process event hub,
+ * which is where the turn's tool results surface; the note goes through the
+ * same client call a model's own progress note does.
+ */
+export function watchToolFailures(
+  active: ActiveTask,
+  conversationId: string,
+): { dispose(): void } {
+  return assistantEventHub.subscribe({
+    type: "process",
+    filter: { conversationId },
+    callback: (envelope) => {
+      const message = envelope.message as {
+        type?: string;
+        toolName?: string;
+        result?: string;
+        isError?: boolean;
+        errorCode?: string;
+      };
+      if (message.type !== "tool_result" || !message.toolName) {
+        return;
+      }
+      if (active.settled || getActiveTask() !== active) {
+        return;
+      }
+      const found = observeToolResult(
+        active,
+        message.toolName,
+        message.isError === true,
+        message.result ?? "",
+        message.errorCode,
+      );
+      if (found) {
+        // Counted as noted only once the workspace took it: a note that
+        // never landed is retried on the tool's next failure.
+        void reportTaskProgress(active.claim.task_id, found.note)
+          .then((posted) => {
+            if (posted.outcome !== "ok") {
+              releaseBrokenToolNote(active, found.tool);
+            }
+          })
+          .catch((err) => {
+            releaseBrokenToolNote(active, found.tool);
+            log.debug({ err }, "Could not post the broken-tool note");
+          });
+      }
+    },
+  });
 }
 
 /** How often the runner looks at a conversation still taking instructions. */
@@ -364,5 +434,7 @@ Three things to know about how this ends.
 **Finish with exactly one of two tools.** Call \`submit_task\` when the work is actually done, with a summary a reviewer can check — the card goes to a review column and a person verifies it, so it does not become done because you said so. Call \`release_task\` when you cannot do it, with a specific reason. Do not end your turn without calling one of them: the card comes back unexplained, and whoever assigned it learns nothing.
 
 **If you are stuck on a decision rather than blocked, ask.** Use \`ask_question\` to put it in front of a named person rather than guessing. A guess that looks like work is worse than a question.
+
+A file in your sandbox is not a deliverable; nobody can open it. Attach everything you produced for this card with \`attach_task_file\` or \`submit_task\`'s \`attachments\`.
 
 Use \`report_task_progress\` along the way if you find something worth a person knowing before you finish.`;
