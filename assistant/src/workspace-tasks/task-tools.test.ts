@@ -467,6 +467,42 @@ describe("deliverables", () => {
     ).toHaveLength(1);
   });
 
+  test("submit attachments take new files only; attach_task_file takes any", async () => {
+    const { utimesSync } = await import("node:fs");
+    writeFileSync(join(ws, "old.md"), "# old\n");
+    const past = new Date(Date.now() - 3_600_000);
+    utimesSync(join(ws, "old.md"), past, past);
+    writeFileSync(join(ws, "fresh.md"), "# fresh\n");
+    setActiveTask({
+      task: TASK,
+      claim: CLAIM,
+      settled: null,
+      startedAt: Date.now() - 1_000,
+    });
+    const fresh = await submitTaskTool.execute(
+      { summary: "Done.", attachments: ["fresh.md"] },
+      ctx,
+    );
+    expect(fresh.isError).toBe(false);
+
+    setActiveTask({
+      task: TASK,
+      claim: CLAIM,
+      settled: null,
+      startedAt: Date.now() - 1_000,
+    });
+    const old = await submitTaskTool.execute(
+      { summary: "Done.", attachments: ["old.md"] },
+      ctx,
+    );
+    expect(old.isError).toBe(true);
+    expect(old.content).toContain("attach_task_file");
+    expect(getActiveTask()?.settled).toBeNull();
+
+    const viaTool = await attachTaskFileTool.execute({ path: "old.md" }, ctx);
+    expect(viaTool.isError).toBe(false);
+  });
+
   test("attach_task_file is a medium-risk tool", () => {
     expect(attachTaskFileTool.defaultRiskLevel).toBe(RiskLevel.Medium);
   });

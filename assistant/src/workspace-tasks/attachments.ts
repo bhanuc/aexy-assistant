@@ -55,7 +55,16 @@ export interface Deliverable {
 export interface DeliverableHooks {
   /** Runs after the path is vetted and before it is opened. */
   afterCheck?: () => void;
+  /**
+   * Refuse a file last modified before this time (ms since epoch, less
+   * {@link CLOCK_SLACK_MS}): what the `attachments` field of submit_task and
+   * report_task_progress passes, so it uploads only work done in this claim.
+   */
+  modifiedSinceMs?: number;
 }
+
+/** Tolerance for clock and filesystem timestamp granularity. */
+const CLOCK_SLACK_MS = 2_000;
 
 function isInside(boundary: string, target: string): boolean {
   const rel = relative(boundary, target);
@@ -141,6 +150,18 @@ export async function readDeliverable(
       return {
         ok: false,
         error: `${rawPath} is not a regular file, so it cannot be attached.`,
+      };
+    }
+    if (
+      hooks?.modifiedSinceMs !== undefined &&
+      stats.mtimeMs < hooks.modifiedSinceMs - CLOCK_SLACK_MS
+    ) {
+      return {
+        ok: false,
+        error:
+          `${rawPath} was not created or changed during this task, so it cannot go in ` +
+          "the attachments field. If you really mean to deliver an existing file, " +
+          "use attach_task_file, which a person or approval policy can see.",
       };
     }
     if (stats.size === 0) {
@@ -273,7 +294,12 @@ export async function attachFiles(
   const ids: string[] = [];
   const done: string[] = [];
   for (const path of paths) {
-    const outcome = await attachFile(active, path, undefined, workingDir);
+    // Inline attachments only carry this claim's own work; an older file
+    // goes through attach_task_file, which is gated by its risk level.
+    const outcome = await attachFile(active, path, undefined, workingDir, {
+      modifiedSinceMs:
+        active.startedAt ?? (Date.parse(active.claim.claimed_at) || undefined),
+    });
     if (!outcome.ok) {
       const remaining = paths.slice(paths.indexOf(path));
       return {

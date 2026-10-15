@@ -24,6 +24,8 @@ export interface ActiveTask {
   claim: WorkspaceTaskClaim;
   /** Set by the task tools so the runner knows the turn settled itself. */
   settled: "submitted" | "released" | null;
+  /** When this process started the claim (ms); bounds inline attachments. */
+  startedAt?: number;
   /**
    * The conversation working the card, once the turn has one. Reported to
    * the workspace on heartbeats (C8) and followed by the live view.

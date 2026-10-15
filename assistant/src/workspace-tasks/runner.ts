@@ -124,7 +124,12 @@ async function workClaimedTask(
   claim: WorkspaceTaskClaim,
   signal?: AbortSignal,
 ): Promise<TaskRunOutcome> {
-  const active: ActiveTask = { task, claim, settled: null };
+  const active: ActiveTask = {
+    task,
+    claim,
+    settled: null,
+    startedAt: Date.now(),
+  };
   setActiveTask(active);
   const heartbeat = startHeartbeat(active, signal);
   // Under the live view the desktop the agent browses on stays up for the
