@@ -13,7 +13,11 @@
  * that could name the card could submit somebody else's.
  */
 
-import type { WorkspaceTask, WorkspaceTaskClaim } from "./client.js";
+import type {
+  UploadedTaskAttachment,
+  WorkspaceTask,
+  WorkspaceTaskClaim,
+} from "./client.js";
 
 export interface ActiveTask {
   task: WorkspaceTask;
@@ -26,7 +30,12 @@ export interface ActiveTask {
    */
   conversationId?: string;
   /** Files uploaded to the card during this claim, in order. */
-  uploads?: { id: string; fileName: string }[];
+  uploads?: { id: string; fileName: string; realPath?: string }[];
+  /**
+   * Uploads by file identity (dev, inode, size, mtime), so the same file
+   * attached twice, or re-sent after a lost answer, is one attachment.
+   */
+  uploadsByIdentity?: Map<string, UploadedTaskAttachment>;
   /** Consecutive failures per tool name, for the broken-tool note. */
   toolFailures?: Map<string, number>;
   /** Tools already noted as failing on this claim: one note each. */

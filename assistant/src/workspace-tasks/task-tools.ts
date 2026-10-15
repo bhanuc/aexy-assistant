@@ -24,7 +24,7 @@ import type {
   ToolExecutionResult,
 } from "../tools/types.js";
 import { getActiveTask, markSettled } from "./active-task.js";
-import { attachFile, attachFiles, mentionedFile } from "./attachments.js";
+import { attachFile, attachFiles, unattachedMentions } from "./attachments.js";
 import { releaseTask, reportTaskProgress, submitTask } from "./client.js";
 
 const NO_TASK =
@@ -199,15 +199,14 @@ export const submitTaskTool = {
       }
       attachmentIds = uploaded.ids;
     }
-    const mentioned = mentionedFile(parsed.data.summary);
-    if (
-      mentioned &&
-      !active.uploads?.length &&
-      !parsed.data.confirm_no_attachments
-    ) {
+    const unattached = parsed.data.confirm_no_attachments
+      ? []
+      : unattachedMentions(parsed.data.summary, active, context?.workingDir);
+    if (unattached.length) {
       return {
         content:
-          `Your summary mentions "${mentioned}" but nothing was attached to ` +
+          `Your summary mentions ${unattached.map((n) => `"${n}"`).join(", ")} ` +
+          "but it was not attached to " +
           "this card. A file in your sandbox is not a deliverable; nobody " +
           "can open it. Attach it (attach_task_file, or the attachments " +
           "field here) and submit again — or, if you really are not " +
@@ -251,7 +250,13 @@ export const attachTaskFileTool = {
     "attachment id.",
   category: "interaction",
   executionTarget: "sandbox",
-  defaultRiskLevel: RiskLevel.Low,
+  // Medium, not Low like the other task tools: this one moves a file out of
+  // the pod to a place other people read. The sandbox boundary keeps it to
+  // the workspace, but a workspace holds things a prompt-injected card
+  // should not be able to publish unreviewed (fetched pages, credentials a
+  // script wrote), so it sits behind the same approval threshold as
+  // host_file transfer rather than being a free pass.
+  defaultRiskLevel: RiskLevel.Medium,
   input_schema: toToolInputSchema(attachSchema),
 
   async execute(
@@ -277,7 +282,7 @@ export const attachTaskFileTool = {
     }
     return {
       content:
-        `Attached ${outcome.attachment.file_name} to the card ` +
+        `${outcome.reused ? "Already attached: " : "Attached "}${outcome.attachment.file_name} to the card ` +
         `(attachment id ${outcome.attachment.id}).`,
       isError: false,
     };

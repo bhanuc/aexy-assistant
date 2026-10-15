@@ -18,6 +18,7 @@ let conversationDuringTurn: string | null = null;
 let activeDuringTurn: any = null;
 const released: any[] = [];
 const progressPosts: any[] = [];
+let progressOutcome: "ok" | "unavailable" = "ok";
 let jobCalls: any[] = [];
 let turnHook: (() => Promise<void>) | null = null;
 let jobResult: any = { ok: true, conversationId: "c1" };
@@ -66,7 +67,11 @@ mock.module("./client.js", () => ({
   submitTask: () => Promise.resolve({ outcome: "ok", value: CLAIM }),
   reportTaskProgress: (taskId: string, note: string) => {
     progressPosts.push({ taskId, note });
-    return Promise.resolve({ outcome: "ok", value: {} });
+    return Promise.resolve(
+      progressOutcome === "ok"
+        ? { outcome: "ok", value: {} }
+        : { outcome: "unavailable", reason: "down" },
+    );
   },
   MAX_ATTACHMENT_BYTES: 25 * 1024 * 1024,
   uploadTaskAttachment: () => Promise.reject(new Error("not used")),
@@ -110,6 +115,7 @@ describe("running the next workspace task", () => {
     heartbeatResult = { outcome: "ok", value: CLAIM };
     released.length = 0;
     progressPosts.length = 0;
+    progressOutcome = "ok";
     heartbeats.length = 0;
     conversationDuringTurn = null;
     activeDuringTurn = null;
@@ -285,46 +291,101 @@ describe("running the next workspace task", () => {
     expect(postamble).toContain("attach_task_file");
   });
 
-  test("a tool failing three times in a row is noted once per claim", async () => {
+  /** Publish tool results on a conversation and run a card around them. */
+  async function runWithToolResults(
+    run: (
+      result: (
+        toolName: string,
+        isError: boolean,
+        text?: string,
+      ) => Promise<unknown>,
+    ) => Promise<void>,
+  ) {
     const { assistantEventHub } =
       await import("../runtime/assistant-event-hub.js");
     conversationDuringTurn = "conv-fail";
-    const result = (toolName: string, isError: boolean) =>
-      assistantEventHub.publish({
-        message: {
-          type: "tool_result",
-          toolName,
-          result: "ECONNRESET talking to the site\nstack trace",
-          isError,
-          conversationId: "conv-fail",
-        } as any,
-        conversationId: "conv-fail",
-      } as any);
     settleDuringTurn = null;
     jobResult = { ok: true, conversationId: "conv-fail" };
     conversations["conv-fail"] = {
       isProcessing: () => false,
       hasQueuedMessages: () => false,
     };
-    turnHook = async () => {
-      await result("web_fetch", true);
-      await result("web_fetch", true);
-      await result("web_fetch", false); // a success resets the streak
-      await result("web_fetch", true);
-      await result("web_fetch", true);
-      expect(progressPosts).toHaveLength(0);
-      await result("web_fetch", true);
-      await result("web_fetch", true);
-      await result("web_fetch", true);
-      await result("browser", true);
-    };
+    const result = (toolName: string, isError: boolean, text = "boom") =>
+      assistantEventHub.publish({
+        message: {
+          type: "tool_result",
+          toolName,
+          result: text,
+          isError,
+          conversationId: "conv-fail",
+        } as any,
+        conversationId: "conv-fail",
+      } as any);
+    turnHook = () => run(result);
     await runNextWorkspaceTask();
+  }
+
+  test("a tool failing three times in a row is noted once per claim, in fixed words", async () => {
+    await runWithToolResults(async (result) => {
+      const secret = "ECONNRESET sk-ant-api03-SECRETSECRET talking to the site";
+      await result("web_fetch", true, secret);
+      await result("web_fetch", true, secret);
+      await result("web_fetch", false); // a success resets the streak
+      await result("web_fetch", true, secret);
+      await result("web_fetch", true, secret);
+      expect(progressPosts).toHaveLength(0);
+      await result("web_fetch", true, secret);
+      await result("web_fetch", true, secret);
+      await result("web_fetch", true, secret);
+      await result("browser", true, secret);
+    });
     expect(progressPosts).toEqual([
       {
         taskId: "task-1",
-        note: "web_fetch is failing (ECONNRESET talking to the site); working around it.",
+        note: "web\\_fetch keeps failing (ECONNRESET); working around it.",
       },
     ]);
+  });
+
+  test("three web_search 404 provider errors are one note", async () => {
+    await runWithToolResults(async (result) => {
+      for (let i = 0; i < 3; i++) {
+        await result(
+          "web_search",
+          true,
+          "Provider error: HTTP 404 from search",
+        );
+      }
+    });
+    expect(progressPosts).toHaveLength(1);
+    expect(progressPosts[0].note).toContain("keeps failing (HTTP 404)");
+  });
+
+  test("non-zero shell exits are the work, not a broken tool", async () => {
+    await runWithToolResults(async (result) => {
+      for (let i = 0; i < 4; i++) {
+        await result(
+          "bash",
+          true,
+          "exit code 1: tests failed\nHTTP 500 in the fixture",
+        );
+      }
+    });
+    expect(progressPosts).toHaveLength(0);
+  });
+
+  test("a note that did not land is tried again on the next failure", async () => {
+    progressOutcome = "unavailable";
+    await runWithToolResults(async (result) => {
+      for (let i = 0; i < 3; i++) {
+        await result("web_search", true, "HTTP 503");
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      progressOutcome = "ok";
+      await result("web_search", true, "HTTP 503");
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(progressPosts).toHaveLength(2);
   });
 
   test("a pod not connected to a workspace does nothing quietly", async () => {

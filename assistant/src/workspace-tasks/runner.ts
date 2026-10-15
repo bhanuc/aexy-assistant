@@ -53,7 +53,10 @@ import {
   type WorkspaceTask,
   type WorkspaceTaskClaim,
 } from "./client.js";
-import { observeToolResult } from "./tool-failure-note.js";
+import {
+  observeToolResult,
+  releaseBrokenToolNote,
+} from "./tool-failure-note.js";
 
 const log = getLogger("workspace-tasks-runner");
 
@@ -157,6 +160,9 @@ async function workClaimedTask(
       onConversationCreated: (conversationId) => {
         setActiveTaskConversation(conversationId);
         heartbeat.beatNow();
+        // A second conversation for the same claim replaces the first
+        // watcher; the old subscription must not outlive it.
+        watchTools.current?.dispose();
         watchTools.current = watchToolFailures(active, conversationId);
       },
       assistantSandwich: {
@@ -228,20 +234,34 @@ export function watchToolFailures(
         toolName?: string;
         result?: string;
         isError?: boolean;
+        errorCode?: string;
       };
       if (message.type !== "tool_result" || !message.toolName) {
         return;
       }
-      const note = observeToolResult(
+      if (active.settled || getActiveTask() !== active) {
+        return;
+      }
+      const found = observeToolResult(
         active,
         message.toolName,
         message.isError === true,
         message.result ?? "",
+        message.errorCode,
       );
-      if (note && getActiveTask() === active) {
-        void reportTaskProgress(active.claim.task_id, note).catch((err) =>
-          log.debug({ err }, "Could not post the broken-tool note"),
-        );
+      if (found) {
+        // Counted as noted only once the workspace took it: a note that
+        // never landed is retried on the tool's next failure.
+        void reportTaskProgress(active.claim.task_id, found.note)
+          .then((posted) => {
+            if (posted.outcome !== "ok") {
+              releaseBrokenToolNote(active, found.tool);
+            }
+          })
+          .catch((err) => {
+            releaseBrokenToolNote(active, found.tool);
+            log.debug({ err }, "Could not post the broken-tool note");
+          });
       }
     },
   });

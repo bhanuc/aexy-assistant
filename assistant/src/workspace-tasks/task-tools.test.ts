@@ -15,19 +15,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+
+import { RiskLevel } from "../permissions/types.js";
 
 let submitResult: any = { outcome: "ok", value: {} };
 let releaseResult: any = { outcome: "ok", value: {} };
 let progressResult: any = { outcome: "ok", value: {} };
 const calls: any[] = [];
 let uploadSeq = 0;
-let uploadResult: (filePath: string) => any = (filePath) => ({
+let uploadResult: (fileName: string) => any = (fileName) => ({
   outcome: "ok",
   value: {
     id: `att-${++uploadSeq}`,
-    file_name: basename(filePath),
+    file_name: fileName,
     content_type: null,
     file_size: 1,
     url: "/dl",
@@ -70,9 +72,20 @@ mock.module("./client.js", () => ({
     return Promise.resolve(progressResult);
   },
   MAX_ATTACHMENT_BYTES: 25 * 1024 * 1024,
-  uploadTaskAttachment: (taskId: string, filePath: string, note?: string) => {
-    calls.push({ kind: "upload", taskId, filePath, note });
-    return Promise.resolve(uploadResult(filePath));
+  uploadTaskAttachment: (
+    taskId: string,
+    bytes: Buffer,
+    fileName: string,
+    note?: string,
+  ) => {
+    calls.push({
+      kind: "upload",
+      taskId,
+      fileName,
+      bytes: bytes.toString(),
+      note,
+    });
+    return Promise.resolve(uploadResult(fileName));
   },
 }));
 
@@ -180,6 +193,14 @@ describe("deliverables", () => {
   writeFileSync(join(outside, "secret.txt"), "nope");
   symlinkSync(join(outside, "secret.txt"), join(ws, "link.txt"));
   symlinkSync(outside, join(ws, "outdir"));
+  mkdirSync(join(ws, "data", "aexy-competitors"), { recursive: true });
+  writeFileSync(
+    join(ws, "data", "aexy-competitors", "COMPETITORS.md"),
+    "# c\n",
+  );
+  writeFileSync(join(ws, "data", "SECOND.md"), "# second\n");
+  writeFileSync(join(ws, "package.json"), "{}");
+  writeFileSync(join(ws, "empty.md"), "");
 
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -203,7 +224,8 @@ describe("deliverables", () => {
     expect(calls[0]).toEqual({
       kind: "upload",
       taskId: "task-1",
-      filePath: join(ws, "data", "MAP.md"),
+      fileName: "MAP.md",
+      bytes: "# map\n",
       note: "competitors",
     });
   });
@@ -260,11 +282,11 @@ describe("deliverables", () => {
     );
     expect(result.isError).toBe(true);
     expect(result.content).toContain("too_many_attachments");
-    uploadResult = (filePath) => ({
+    uploadResult = (fileName) => ({
       outcome: "ok",
       value: {
         id: `att-${++uploadSeq}`,
-        file_name: basename(filePath),
+        file_name: fileName,
         content_type: null,
         file_size: 1,
         url: "/dl",
@@ -305,9 +327,10 @@ describe("deliverables", () => {
   });
 
   test("a summary naming a file with nothing attached is bounced", async () => {
-    const result = await submitTaskTool.execute({
-      summary: "Wrote data/aexy-competitors/COMPETITORS.md with the map.",
-    });
+    const result = await submitTaskTool.execute(
+      { summary: "Wrote data/aexy-competitors/COMPETITORS.md with the map." },
+      ctx,
+    );
     expect(result.isError).toBe(true);
     expect(result.content).toContain("COMPETITORS.md");
     expect(result.content).toContain("confirm_no_attachments");
@@ -327,9 +350,125 @@ describe("deliverables", () => {
   test("the guard stays quiet once something was attached during the claim", async () => {
     await attachTaskFileTool.execute({ path: "data/MAP.md" }, ctx);
     const result = await submitTaskTool.execute({
-      summary: "Done; the map is MAP.md.",
+      summary: "Done; the map is data/MAP.md.",
     });
     expect(result.isError).toBe(false);
+  });
+
+  test("one named file uploaded and another not still blocks", async () => {
+    await attachTaskFileTool.execute({ path: "data/MAP.md" }, ctx);
+    const result = await submitTaskTool.execute(
+      { summary: "See data/MAP.md and data/SECOND.md." },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("data/SECOND.md");
+    expect(result.content).not.toContain('"data/MAP.md"');
+  });
+
+  test("project plumbing named in passing is not a deliverable", async () => {
+    const result = await submitTaskTool.execute(
+      { summary: "Updated package.json." },
+      ctx,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("a URL's file name is not a mention", async () => {
+    const result = await submitTaskTool.execute(
+      { summary: "Source: https://example.com/data/SECOND.md for context." },
+      ctx,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("a non-Latin file name is detected", async () => {
+    writeFileSync(join(ws, "отчёт.md"), "# r\n");
+    const result = await submitTaskTool.execute(
+      { summary: "Итог в отчёт.md." },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("отчёт.md");
+  });
+
+  test("a name that does not exist is not a missing deliverable", async () => {
+    const result = await submitTaskTool.execute(
+      { summary: "Compare with ghost.md from last week." },
+      ctx,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("an empty file is refused without calling the workspace", async () => {
+    const result = await attachTaskFileTool.execute({ path: "empty.md" }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("empty");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("the same file attached twice is uploaded once", async () => {
+    await attachTaskFileTool.execute({ path: "data/MAP.md" }, ctx);
+    const again = await attachTaskFileTool.execute(
+      { path: "data/MAP.md" },
+      ctx,
+    );
+    expect(again.isError).toBe(false);
+    expect(again.content).toContain("att-1");
+    expect(calls.filter((c) => c.kind === "upload")).toHaveLength(1);
+  });
+
+  test("a partial failure names what already went up, and a retry sends only the rest", async () => {
+    uploadResult = (fileName) =>
+      fileName === "SECOND.md"
+        ? { outcome: "unavailable", reason: "the workspace answered 503" }
+        : {
+            outcome: "ok",
+            value: {
+              id: `att-${++uploadSeq}`,
+              file_name: fileName,
+              content_type: null,
+              file_size: 1,
+              url: "/dl",
+            },
+          };
+    const first = await submitTaskTool.execute(
+      {
+        summary: "Both attached.",
+        attachments: ["data/MAP.md", "data/SECOND.md"],
+      },
+      ctx,
+    );
+    expect(first.isError).toBe(true);
+    expect(first.content).toContain("MAP.md (att-1)");
+    expect(first.content).toContain("may already be attached");
+    expect(calls.some((c) => c.kind === "submit")).toBe(false);
+
+    uploadResult = (fileName) => ({
+      outcome: "ok",
+      value: {
+        id: `att-${++uploadSeq}`,
+        file_name: fileName,
+        content_type: null,
+        file_size: 1,
+        url: "/dl",
+      },
+    });
+    const retry = await submitTaskTool.execute(
+      {
+        summary: "Both attached.",
+        attachments: ["data/MAP.md", "data/SECOND.md"],
+      },
+      ctx,
+    );
+    expect(retry.isError).toBe(false);
+    expect(
+      calls.filter((c) => c.kind === "upload" && c.fileName === "MAP.md"),
+    ).toHaveLength(1);
+  });
+
+  test("attach_task_file is a medium-risk tool", () => {
+    expect(attachTaskFileTool.defaultRiskLevel).toBe(RiskLevel.Medium);
   });
 
   test("a summary with no file name is not guarded", async () => {

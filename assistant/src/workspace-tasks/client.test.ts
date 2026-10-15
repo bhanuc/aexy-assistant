@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -88,9 +88,12 @@ describe("uploading a deliverable", () => {
   });
 
   test("posts multipart with the file and note, authenticated, no forced content-type", async () => {
-    const file = join(dir, "report.md");
-    writeFileSync(file, "# Hi\n");
-    const result = await uploadTaskAttachment("task-1", file, "the map");
+    const result = await uploadTaskAttachment(
+      "task-1",
+      Buffer.from("# Hi\n"),
+      "report.md",
+      "the map",
+    );
     expect(result).toMatchObject({
       outcome: "ok",
       value: { id: "att-1", file_name: "report.md" },
@@ -111,29 +114,65 @@ describe("uploading a deliverable", () => {
   });
 
   test("omits the note when there is none", async () => {
-    const file = join(dir, "a.txt");
-    writeFileSync(file, "x");
-    await uploadTaskAttachment("task-1", file);
+    await uploadTaskAttachment("task-1", Buffer.from("x"), "a.txt");
     expect((captured!.init.body as FormData).has("note")).toBe(false);
   });
 
   test("a 409 with a coded detail is a refusal with the code in it", async () => {
-    const file = join(dir, "a.txt");
-    writeFileSync(file, "x");
     response = new Response(
       JSON.stringify({ detail: { code: "no_claim", message: "No claim." } }),
       { status: 409 },
     );
-    expect(await uploadTaskAttachment("task-1", file)).toEqual({
+    expect(
+      await uploadTaskAttachment("task-1", Buffer.from("x"), "a.txt"),
+    ).toEqual({
       outcome: "refused",
       reason: "No claim.",
     });
   });
 
-  test("a missing file is refused without calling the workspace", async () => {
-    const result = await uploadTaskAttachment("task-1", join(dir, "nope"));
+  test("an empty file is refused without calling the workspace", async () => {
+    const result = await uploadTaskAttachment(
+      "task-1",
+      Buffer.alloc(0),
+      "nope.txt",
+    );
     expect(result.outcome).toBe("refused");
     expect(captured).toBeNull();
+  });
+
+  test("a 422 detail string is surfaced as the reason", async () => {
+    response = new Response(JSON.stringify({ detail: "that file is empty" }), {
+      status: 422,
+    });
+    expect(
+      await uploadTaskAttachment("task-1", Buffer.from("x"), "a.txt"),
+    ).toEqual({ outcome: "refused", reason: "that file is empty" });
+  });
+
+  test("a 429 waits Retry-After and tries again, twice at most", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts++;
+      return attempts < 3
+        ? new Response(JSON.stringify({ detail: "slow down" }), {
+            status: 429,
+            headers: { "retry-after": "0" },
+          })
+        : new Response(JSON.stringify({ id: "att-9" }), { status: 201 });
+    }) as unknown as typeof fetch;
+    const ok = await uploadTaskAttachment("task-1", Buffer.from("x"), "a.txt");
+    expect(ok).toMatchObject({ outcome: "ok", value: { id: "att-9" } });
+    expect(attempts).toBe(3);
+
+    attempts = -10; // never succeeds
+    const refused = await uploadTaskAttachment(
+      "task-1",
+      Buffer.from("x"),
+      "a.txt",
+    );
+    expect(refused).toEqual({ outcome: "refused", reason: "slow down" });
+    expect(attempts).toBe(-7); // the first try plus two retries
   });
 
   test("submit and progress carry attachment_ids only when given", async () => {

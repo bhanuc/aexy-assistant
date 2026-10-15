@@ -17,9 +17,6 @@
  * is worth trying again.
  */
 
-import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
-
 import { resolveManagedProxyContext } from "../providers/platform-proxy/context.js";
 import { getLogger } from "../util/logger.js";
 
@@ -179,25 +176,19 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 /**
  * Put a file from the sandbox on the card, as the pod's deliverable.
  *
- * `filePath` must already be a vetted, resolved path — the sandbox boundary is
- * enforced by the caller (`attachments.ts`), not here.
+ * Takes the bytes, not a path. The caller (`attachments.ts`) opened and vetted
+ * the file descriptor the bytes came from; reading the path again here would
+ * reopen the window between the check and the read that it closes.
  */
 export async function uploadTaskAttachment(
   taskId: string,
-  filePath: string,
+  bytes: Buffer<ArrayBuffer>,
+  fileName: string,
   note?: string,
   signal?: AbortSignal,
 ): Promise<TaskCallResult<UploadedTaskAttachment>> {
-  let bytes: Buffer;
-  try {
-    bytes = await readFile(filePath);
-  } catch (error) {
-    return {
-      outcome: "refused",
-      reason: `the file could not be read: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    };
+  if (bytes.byteLength === 0) {
+    return { outcome: "refused", reason: "the file is empty" };
   }
   if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
     return {
@@ -206,7 +197,7 @@ export async function uploadTaskAttachment(
     };
   }
   const form = new FormData();
-  form.append("file", new Blob([new Uint8Array(bytes)]), basename(filePath));
+  form.append("file", new Blob([bytes]), fileName);
   if (note?.trim()) {
     form.append("note", note.trim().slice(0, 2000));
   }
@@ -257,12 +248,68 @@ export async function releaseTask(
   );
 }
 
+/** Longest a `Retry-After` is honoured, and how many times it is followed. */
+const MAX_RETRY_AFTER_MS = 10_000;
+const MAX_RATE_LIMIT_RETRIES = 2;
+
+/** `Retry-After` in milliseconds (seconds form only), capped. */
+function retryAfterMs(response: Response): number {
+  const seconds = Number(response.headers.get("retry-after"));
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return 1_000;
+  }
+  return Math.min(seconds * 1_000, MAX_RETRY_AFTER_MS);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * One call, following the platform's 429s: wait what it asked (capped) and
+ * try again, twice at most. A 429 means the request was not processed, so
+ * repeating it cannot duplicate anything.
+ */
 async function call<T>(
   path: string,
   init: RequestInit,
   signal?: AbortSignal,
   timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<TaskCallResult<T>> {
+  let result = await callOnce<T>(path, init, signal, timeoutMs);
+  for (
+    let attempt = 0;
+    attempt < MAX_RATE_LIMIT_RETRIES && result.rateLimitedForMs !== undefined;
+    attempt++
+  ) {
+    await sleep(result.rateLimitedForMs, signal);
+    if (signal?.aborted) {
+      break;
+    }
+    result = await callOnce<T>(path, init, signal, timeoutMs);
+  }
+  const { rateLimitedForMs: _unused, ...settled } = result;
+  return settled as TaskCallResult<T>;
+}
+
+async function callOnce<T>(
+  path: string,
+  init: RequestInit,
+  signal?: AbortSignal,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<TaskCallResult<T> & { rateLimitedForMs?: number }> {
   const { platformBaseUrl, assistantApiKey, enabled } =
     await resolveManagedProxyContext();
   if (!enabled) {
@@ -298,6 +345,9 @@ async function call<T>(
       return {
         outcome: "refused",
         reason: await refusalText(response),
+        ...(response.status === 429
+          ? { rateLimitedForMs: retryAfterMs(response) }
+          : {}),
       };
     }
     return {
