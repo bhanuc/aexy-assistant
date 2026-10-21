@@ -13,6 +13,7 @@
  * Follows the same download/install pattern as qdrant-manager.ts.
  */
 
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -39,17 +40,51 @@ const TRANSFORMERS_VERSION = "3.8.1";
 const JINJA_VERSION = "0.5.5";
 
 /**
+ * sha512 (npm `dist.integrity`) of each pinned tarball. A download that does
+ * not match is rejected, so neither the image bake nor a runtime install can
+ * be handed a swapped package.
+ */
+const NPM_INTEGRITY: Record<string, string> = {
+  "onnxruntime-node@1.21.0":
+    "sha512-NeaCX6WW2L8cRCSqy3bInlo5ojjQqu2fD3D+9W5qb5irwxhEyWKXeH2vZ8W9r6VxaMPUan+4/7NDwZMtouZxEw==",
+  "onnxruntime-common@1.21.0":
+    "sha512-Q632iLLrtCAVOTO65dh2+mNbQir/QNTVBG3h/QdZBpns7mZ0RYbLRBgGABPbpU9351AgYy7SJf1WaeVwMrBFPQ==",
+  "@huggingface/transformers@3.8.1":
+    "sha512-tsTk4zVjImqdqjS8/AOZg2yNLd1z9S5v+7oUPpXaasDRwEDhB+xnglK1k5cad26lL5/ZIaeREgWWy0bs9y9pPA==",
+  "@huggingface/jinja@0.5.5":
+    "sha512-xRlzazC+QZwr6z4ixEqYHo9fgwhTZ3xNSdljlKfUFGZSdlvt166DljRELFUfFytlYOYvo3vTisA/AFOuOAzFQQ==",
+};
+
+/**
+ * Environment variable naming a read-only directory holding a runtime baked
+ * into the container image (see assistant/Dockerfile and
+ * scripts/bake-embedding-runtime.ts). The workspace volume is mounted over
+ * /workspace, so anything the image wants to ship cannot live there.
+ */
+export const BAKED_RUNTIME_DIR_ENV = "VELLUM_EMBEDDING_RUNTIME_DIR";
+
+/**
+ * Environment variable selecting the ONNX dtype the embed worker loads
+ * (`fp32`, `q8`, ...). Unset means `fp32`, which is what every existing
+ * install indexed with; the container image sets `q8`.
+ */
+export const EMBEDDING_DTYPE_ENV = "VELLUM_EMBEDDING_DTYPE";
+
+/**
  * Composite version string for cache invalidation. Bumping the trailing
  * `_workers-vN` suffix forces existing installs to regenerate the worker
  * scripts when the worker IPC contract or spawn-args list changes (without
  * requiring an `@huggingface/transformers` version bump).
+ *
+ * v5: workers read `VELLUM_ONNX_INTER_OP_THREADS` (`interOpNumThreads`) and
+ * the embed worker reads `VELLUM_EMBEDDING_DTYPE` (default `fp32`).
  *
  * v4: workers read `VELLUM_ONNX_INTRA_OP_THREADS` and pass
  * `session_options.intraOpNumThreads` (JARVIS-1398). The environment the host
  * spawns them with counts as part of the contract, so an install that keeps
  * the v3 scripts would silently ignore the cap.
  */
-export const RUNTIME_VERSION = `ort-${ONNXRUNTIME_NODE_VERSION}_hf-${TRANSFORMERS_VERSION}_jinja-${JINJA_VERSION}_workers-v4`;
+export const RUNTIME_VERSION = `ort-${ONNXRUNTIME_NODE_VERSION}_hf-${TRANSFORMERS_VERSION}_jinja-${JINJA_VERSION}_workers-v5`;
 
 const WORKER_FILENAME = "embed-worker.mjs";
 const RERANK_WORKER_FILENAME = "rerank-worker.mjs";
@@ -80,6 +115,7 @@ async function downloadAndExtract(
   url: string,
   targetDir: string,
   signal?: AbortSignal,
+  integrity?: string,
 ): Promise<void> {
   log.info({ url, targetDir }, "Downloading npm package");
 
@@ -91,6 +127,16 @@ async function downloadAndExtract(
   }
 
   const tarball = await response.arrayBuffer();
+
+  if (integrity) {
+    const [algo, expected] = integrity.split("-", 2);
+    const actual = createHash(algo)
+      .update(Buffer.from(tarball))
+      .digest("base64");
+    if (actual !== expected) {
+      throw new Error(`Integrity check failed for ${url}`);
+    }
+  }
 
   // npm tarballs extract to package/, we need to redirect to targetDir
   mkdirSync(targetDir, { recursive: true });
@@ -141,14 +187,24 @@ if (cacheDir && env) env.cacheDir = cacheDir;
 // computes the cap in util/worker-compute.ts and passes it in the environment.
 // A missing or unparseable value means no cap, i.e. the ONNX default.
 const intraOpNumThreads = Number(process.env.VELLUM_ONNX_INTRA_OP_THREADS);
-const sessionOptions =
-  Number.isInteger(intraOpNumThreads) && intraOpNumThreads > 0
-    ? { intraOpNumThreads }
-    : undefined;
+// Inter-op is capped the same way; the host defaults it to 1 so a pod sharing
+// cores with other pods never fans out across operators.
+const interOpNumThreads = Number(process.env.VELLUM_ONNX_INTER_OP_THREADS);
+const sessionOptions = {};
+if (Number.isInteger(intraOpNumThreads) && intraOpNumThreads > 0) {
+  sessionOptions.intraOpNumThreads = intraOpNumThreads;
+}
+if (Number.isInteger(interOpNumThreads) && interOpNumThreads > 0) {
+  sessionOptions.interOpNumThreads = interOpNumThreads;
+}
+
+// fp32 unless the environment asks for a quantized variant (the container image
+// sets q8, i.e. onnx/model_quantized.onnx).
+const dtype = process.env.VELLUM_EMBEDDING_DTYPE || 'fp32';
 
 let extractor;
 try {
-  extractor = await pipeline('feature-extraction', model, { dtype: 'fp32', session_options: sessionOptions });
+  extractor = await pipeline('feature-extraction', model, { dtype, session_options: sessionOptions });
   process.stdout.write(JSON.stringify({ type: 'ready' }) + '\\n');
 } catch (err) {
   process.stdout.write(JSON.stringify({ type: 'error', error: err.message || String(err) }) + '\\n');
@@ -224,10 +280,14 @@ if (cacheDir && env) env.cacheDir = cacheDir;
 // the host computes the cap in util/worker-compute.ts and passes it in the
 // environment. A missing or unparseable value means no cap, i.e. the default.
 const intraOpNumThreads = Number(process.env.VELLUM_ONNX_INTRA_OP_THREADS);
-const sessionOptions =
-  Number.isInteger(intraOpNumThreads) && intraOpNumThreads > 0
-    ? { intraOpNumThreads }
-    : undefined;
+const interOpNumThreads = Number(process.env.VELLUM_ONNX_INTER_OP_THREADS);
+const sessionOptions = {};
+if (Number.isInteger(intraOpNumThreads) && intraOpNumThreads > 0) {
+  sessionOptions.intraOpNumThreads = intraOpNumThreads;
+}
+if (Number.isInteger(interOpNumThreads) && interOpNumThreads > 0) {
+  sessionOptions.interOpNumThreads = interOpNumThreads;
+}
 
 let tokenizer;
 let session;
@@ -296,13 +356,58 @@ process.stdin.on('end', () => process.exit(0));
 `;
 }
 
+// ── Baked runtime ───────────────────────────────────────────────────
+
+function isBakedRuntimeDir(dir: string): boolean {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(join(dir, "version.json"), "utf-8"),
+    );
+    return (
+      manifest.runtimeVersion === RUNTIME_VERSION &&
+      existsSync(join(dir, WORKER_FILENAME)) &&
+      existsSync(join(dir, RERANK_WORKER_FILENAME))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The baked runtime directory, when the image ships one that matches this build. */
+export function getBakedRuntimeDir(): string | undefined {
+  const dir = process.env[BAKED_RUNTIME_DIR_ENV];
+  return dir && isBakedRuntimeDir(dir) ? dir : undefined;
+}
+
+/**
+ * Where the embedding runtime (node_modules, worker scripts) lives: the baked
+ * image copy when there is one, else the workspace's `embedding-models/` that
+ * {@link EmbeddingRuntimeManager.ensureInstalled} downloads into.
+ */
+export function getEmbeddingRuntimeDir(): string {
+  return getBakedRuntimeDir() ?? getEmbeddingModelsDir();
+}
+
+/**
+ * Directory the worker should use as its transformers.js cache for `model`.
+ * A model baked into the image is served from there (read-only, no network);
+ * every other model caches into the writable workspace directory.
+ */
+export function getModelCacheDir(model: string): string {
+  const baked = getBakedRuntimeDir();
+  if (baked && existsSync(join(baked, "model-cache", model))) {
+    return join(baked, "model-cache");
+  }
+  return join(getEmbeddingModelsDir(), "model-cache");
+}
+
 // ── Main manager ────────────────────────────────────────────────────
 
 export class EmbeddingRuntimeManager {
   private readonly baseDir: string;
 
   constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? getEmbeddingModelsDir();
+    this.baseDir = baseDir ?? getEmbeddingRuntimeDir();
   }
 
   /** Check if the embedding runtime is installed and up-to-date. */
@@ -442,21 +547,25 @@ export class EmbeddingRuntimeManager {
           npmTarballUrl("onnxruntime-node", ONNXRUNTIME_NODE_VERSION),
           join(nodeModules, "onnxruntime-node"),
           signal,
+          NPM_INTEGRITY[`onnxruntime-node@${ONNXRUNTIME_NODE_VERSION}`],
         ),
         downloadAndExtract(
           npmTarballUrl("onnxruntime-common", ONNXRUNTIME_COMMON_VERSION),
           join(nodeModules, "onnxruntime-common"),
           signal,
+          NPM_INTEGRITY[`onnxruntime-common@${ONNXRUNTIME_COMMON_VERSION}`],
         ),
         downloadAndExtract(
           npmTarballUrl("@huggingface/transformers", TRANSFORMERS_VERSION),
           join(nodeModules, "@huggingface", "transformers"),
           signal,
+          NPM_INTEGRITY[`@huggingface/transformers@${TRANSFORMERS_VERSION}`],
         ),
         downloadAndExtract(
           npmTarballUrl("@huggingface/jinja", JINJA_VERSION),
           join(nodeModules, "@huggingface", "jinja"),
           signal,
+          NPM_INTEGRITY[`@huggingface/jinja@${JINJA_VERSION}`],
         ),
       ];
 

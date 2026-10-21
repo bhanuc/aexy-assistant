@@ -40,10 +40,6 @@ export function getSandboxWorkingDir(): string {
   return hostPlatform.getSandboxWorkingDir();
 }
 
-export function getEmbeddingModelsDir(): string {
-  return hostPlatform.getEmbeddingModelsDir();
-}
-
 export function getMemoryWorkerPidPath(): string {
   return hostPlatform.getMemoryWorkerPidPath();
 }

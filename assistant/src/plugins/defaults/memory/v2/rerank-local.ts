@@ -2,14 +2,17 @@
 import { existsSync } from "node:fs";
 
 import type { RerankDtype } from "../../../../config/schemas/memory-v2.js";
-import { EmbeddingRuntimeManager } from "../../../../persistence/embeddings/embedding-runtime-manager.js";
+import {
+  EmbeddingRuntimeManager,
+  getEmbeddingRuntimeDir,
+  getModelCacheDir,
+} from "../../../../persistence/embeddings/embedding-runtime-manager.js";
 import {
   PromiseGuard,
   workerComputeEnv,
   workerMemoryEnv,
 } from "../host-utils.js";
 import { getLogger } from "../logging.js";
-import { getEmbeddingModelsDir } from "../paths.js";
 
 const log = getLogger("memory-rerank-local");
 
@@ -147,8 +150,8 @@ export class LocalRerankBackend {
     bunPath: string,
     workerPath: string,
   ): Promise<void> {
-    const embeddingModelsDir = getEmbeddingModelsDir();
-    const modelCacheDir = `${embeddingModelsDir}/model-cache`;
+    const runtimeDir = getEmbeddingRuntimeDir();
+    const modelCacheDir = getModelCacheDir(this.model);
 
     log.info(
       { bunPath, workerPath, model: this.model, dtype: this.dtype },
@@ -169,7 +172,7 @@ export class LocalRerankBackend {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
-      cwd: embeddingModelsDir,
+      cwd: runtimeDir,
     });
 
     this.workerProc = proc;

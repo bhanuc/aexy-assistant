@@ -23,10 +23,10 @@ import {
  * Fingerprint of the two generated scripts. Update this together with the
  * `_workers-vN` bump below, never on its own.
  */
-const EXPECTED_WORKER_SCRIPTS_HASH = "4f85253eaebd315";
+const EXPECTED_WORKER_SCRIPTS_HASH = "ef233f65e4d3ad41";
 
 /** Suffix the fingerprint above was taken at. */
-const EXPECTED_WORKERS_VERSION = "workers-v4";
+const EXPECTED_WORKERS_VERSION = "workers-v5";
 
 function workerScriptsHash(): string {
   // The two scripts are joined by a NUL, written as an escape so this file

@@ -9,10 +9,7 @@ import { join } from "node:path";
 
 import { getIsContainerized } from "../../config/env-registry.js";
 import { getLogger } from "../../util/logger.js";
-import {
-  getEmbeddingModelsDir,
-  getEmbedWorkerPidPath,
-} from "../../util/platform.js";
+import { getEmbedWorkerPidPath } from "../../util/platform.js";
 import { isProcessAlive } from "../../util/process-liveness.js";
 import { PromiseGuard } from "../../util/promise-guard.js";
 import { workerComputeEnv } from "../../util/worker-compute.js";
@@ -22,7 +19,12 @@ import {
   listWorkerProcesses,
   pid1OwnsWorkers,
 } from "../../util/worker-ownership.js";
-import { EmbeddingRuntimeManager } from "./embedding-runtime-manager.js";
+import {
+  EmbeddingRuntimeManager,
+  getBakedRuntimeDir,
+  getEmbeddingRuntimeDir,
+  getModelCacheDir,
+} from "./embedding-runtime-manager.js";
 import {
   type EmbeddingBackend,
   type EmbeddingInput,
@@ -57,9 +59,15 @@ function isModelCorruptionError(err: unknown): boolean {
 }
 
 /** Remove the cached model files so they are re-downloaded on next attempt. */
-function clearModelCache(): void {
-  const embeddingModelsDir = getEmbeddingModelsDir();
-  const modelCacheDir = join(embeddingModelsDir, "model-cache");
+function clearModelCache(model: string): void {
+  const modelCacheDir = getModelCacheDir(model);
+  // A model baked into the image is read-only and checksum-verified at build
+  // time; clearing it would be pointless (there is nothing to re-download from
+  // the workspace) and may not be permitted.
+  const baked = getBakedRuntimeDir();
+  if (baked && modelCacheDir.startsWith(baked)) {
+    return;
+  }
   if (existsSync(modelCacheDir)) {
     log.info({ modelCacheDir }, "Removing corrupted model cache");
     try {
@@ -298,7 +306,7 @@ export class LocalEmbeddingBackend implements EmbeddingBackend {
           { err, model: this.model },
           "Model cache appears corrupted, clearing and retrying",
         );
-        clearModelCache();
+        clearModelCache(this.model);
         await this.startWorker(bunPath, workerPath);
       } else {
         throw err;
@@ -310,8 +318,8 @@ export class LocalEmbeddingBackend implements EmbeddingBackend {
     bunPath: string,
     workerPath: string,
   ): Promise<void> {
-    const embeddingModelsDir = getEmbeddingModelsDir();
-    const modelCacheDir = `${embeddingModelsDir}/model-cache`;
+    const runtimeDir = getEmbeddingRuntimeDir();
+    const modelCacheDir = getModelCacheDir(this.model);
 
     this.workerPath = workerPath;
 
@@ -338,7 +346,7 @@ export class LocalEmbeddingBackend implements EmbeddingBackend {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
-      cwd: embeddingModelsDir,
+      cwd: runtimeDir,
     });
 
     // Type-compatible assignment

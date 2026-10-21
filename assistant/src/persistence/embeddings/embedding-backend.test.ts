@@ -1,6 +1,20 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 
 import type { AssistantConfig } from "../../config/types.js";
+import {
+  _resetManagedProviderAvailability,
+  isManagedProviderUnavailable,
+  MANAGED_UNAVAILABLE_BACKOFF_MS,
+  ManagedProviderNotConfiguredError,
+} from "../../providers/platform-proxy/managed-availability.js";
 import {
   clearEmbeddingBackendCache,
   customEmbeddingSpaceIdentity,
@@ -362,6 +376,147 @@ describe("managed-proxy Gemini fallback to direct key", () => {
     const [directUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(directUrl).toContain("generativelanguage.googleapis.com");
     expect(directUrl).toContain("key=direct-key");
+  });
+});
+
+const AUTO_CONFIG = {
+  llm: { default: {} },
+  memory: {
+    embeddings: {
+      provider: "auto",
+      localModel: "Xenova/bge-small-en-v1.5",
+      geminiModel: "test-model",
+    },
+    qdrant: { vectorSize: 3 },
+  },
+} as unknown as AssistantConfig;
+
+/** What the control plane's runtime proxy returns for a provider with no key. */
+const NOT_CONFIGURED_BODY = {
+  code: "provider_unreachable",
+  detail: "this provider is not configured on this deployment",
+};
+
+describe("auto mode on a platform-managed deployment", () => {
+  const originalFetch = globalThis.fetch;
+  let fetchMock: ReturnType<typeof mock>;
+
+  beforeEach(() => {
+    clearEmbeddingBackendCache();
+    _resetManagedProviderAvailability();
+    resolveManagedProxyContextMock.mockImplementation(
+      async () => ENABLED_PROXY_CONTEXT,
+    );
+    fetchMock = mock(async () => jsonResponse(NOT_CONFIGURED_BODY, 503));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearEmbeddingBackendCache();
+    _resetManagedProviderAvailability();
+    resolveManagedProxyContextMock.mockReset();
+    resolveManagedProxyContextMock.mockImplementation(
+      async () => DISABLED_PROXY_CONTEXT,
+    );
+  });
+
+  /** Make the local backend fail so the chain has to reach managed Gemini. */
+  async function breakLocalEmbeds(): Promise<void> {
+    const { backend } = await selectEmbeddingBackend(AUTO_CONFIG);
+    (backend as { embed: unknown }).embed = mock(async () => {
+      throw new Error("local runtime unavailable");
+    });
+  }
+
+  test("prefers the local backend over managed Gemini", async () => {
+    const { backend } = await selectEmbeddingBackend(AUTO_CONFIG);
+    expect(backend?.provider).toBe("local");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test("an explicit gemini provider still uses managed Gemini", async () => {
+    const { backend } = await selectEmbeddingBackend(GEMINI_CONFIG);
+    expect(backend?.provider).toBe("gemini");
+  });
+
+  test("a not-configured 503 marks managed Gemini unavailable and throws a typed error", async () => {
+    await breakLocalEmbeds();
+
+    await expect(
+      embedWithBackend(AUTO_CONFIG, ["hello"]),
+    ).rejects.toBeInstanceOf(ManagedProviderNotConfiguredError);
+    expect(isManagedProviderUnavailable("gemini")).toBe(true);
+    // One request: the batch/single re-send fan-out is not attempted.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("a not-configured batch is not re-sent one text per call", async () => {
+    await breakLocalEmbeds();
+
+    await expect(
+      embedWithBackend(AUTO_CONFIG, ["a", "b", "c"]),
+    ).rejects.toBeInstanceOf(ManagedProviderNotConfiguredError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("auto skips managed Gemini while it is marked unavailable (no retry storm)", async () => {
+    await breakLocalEmbeds();
+    await expect(embedWithBackend(AUTO_CONFIG, ["one"])).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    for (let i = 0; i < 5; i++) {
+      await expect(
+        embedWithBackend(AUTO_CONFIG, [`again ${i}`]),
+      ).rejects.toThrow(/local runtime unavailable/);
+    }
+    // The platform was asked once, not once per attempt.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("an unrelated 503 does not mark the provider unavailable", async () => {
+    fetchMock = mock(async () =>
+      jsonResponse(
+        {
+          code: "provider_unreachable",
+          detail: "the provider could not be reached",
+        },
+        503,
+      ),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await breakLocalEmbeds();
+
+    await expect(embedWithBackend(AUTO_CONFIG, ["hello"])).rejects.toThrow(
+      /503/,
+    );
+    expect(isManagedProviderUnavailable("gemini")).toBe(false);
+  });
+
+  test("managed Gemini is probed again once the backoff window ends", async () => {
+    await breakLocalEmbeds();
+    const realNow = Date.now();
+    const nowSpy = spyOn(Date, "now").mockReturnValue(realNow);
+    try {
+      await expect(embedWithBackend(AUTO_CONFIG, ["x"])).rejects.toThrow();
+      expect(isManagedProviderUnavailable("gemini")).toBe(true);
+
+      // Platform now has a key.
+      fetchMock.mockImplementation(async () =>
+        jsonResponse({ embedding: { values: [0.1, 0.2, 0.3] } }, 200),
+      );
+      nowSpy.mockReturnValue(realNow + MANAGED_UNAVAILABLE_BACKOFF_MS - 1000);
+      await expect(embedWithBackend(AUTO_CONFIG, ["y"])).rejects.toThrow(
+        /local runtime unavailable/,
+      );
+
+      nowSpy.mockReturnValue(realNow + MANAGED_UNAVAILABLE_BACKOFF_MS + 1000);
+      const result = await embedWithBackend(AUTO_CONFIG, ["z"]);
+      expect(result.provider).toBe("gemini");
+      expect(isManagedProviderUnavailable("gemini")).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
 
