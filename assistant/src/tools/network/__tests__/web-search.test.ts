@@ -13,7 +13,6 @@ let mockFastcrwSecureKey: string | undefined;
 let mockManagedSearchProxyResult: any;
 let mockManagedSearchAvailable = true;
 let mockManagedSearchProxyCalls: Array<{
-  provider: string;
   request: Record<string, unknown>;
   signal?: AbortSignal;
 }> = [];
@@ -75,12 +74,11 @@ mock.module("../../../permissions/types.js", () => ({
 }));
 
 mock.module("../managed-search-proxy.js", () => ({
-  callManagedSearchProxy: async (
-    provider: string,
+  callManagedSearch: async (
     request: Record<string, unknown>,
     signal?: AbortSignal,
   ) => {
-    mockManagedSearchProxyCalls.push({ provider, request, signal });
+    mockManagedSearchProxyCalls.push({ request, signal });
     return mockManagedSearchProxyResult;
   },
   managedSearchAvailable: async () => mockManagedSearchAvailable,
@@ -88,6 +86,16 @@ mock.module("../managed-search-proxy.js", () => ({
 
 // Import after the mocks above so the module under test sees them.
 const { webSearchTool } = await import("../web-search.js");
+
+function platformError(status: number, detail: string) {
+  return {
+    ok: false,
+    kind: "platform-error",
+    status,
+    detail,
+    message: `Managed web search returned status ${status}: ${detail}`,
+  };
+}
 
 describe("web_search tool", () => {
   let originalFetch: typeof globalThis.fetch;
@@ -105,9 +113,9 @@ describe("web_search tool", () => {
     mockManagedSearchAvailable = true;
     mockManagedSearchProxyResult = {
       ok: true,
-      status: 200,
-      headers: { "content-type": "application/json" },
-      body: { web: { results: [] } },
+      query: "q",
+      provider: "brave",
+      results: [],
     };
   });
 
@@ -152,7 +160,10 @@ describe("web_search tool", () => {
 
     expect(result.isError).toBe(false);
     expect(mockManagedSearchProxyCalls).toHaveLength(1);
-    expect(mockManagedSearchProxyCalls[0].provider).toBe("brave");
+    expect(mockManagedSearchProxyCalls[0].request).toEqual({
+      q: "vellum managed query",
+      count: 10,
+    });
   });
 
   test("provider vellum routes managed even under a stale your-own mode", async () => {
@@ -170,14 +181,7 @@ describe("web_search tool", () => {
     // a user's paid third-party key (and vice versa).
     seedWebSearch(undefined, "vellum");
     mockPerplexitySecureKey = "pplx-should-not-be-used";
-    mockManagedSearchProxyResult = {
-      ok: false,
-      kind: "platform-error",
-      status: 402,
-      headers: { "content-type": "application/json" },
-      body: { detail: "Insufficient balance" },
-      message: "Managed search proxy returned status 402: Insufficient balance",
-    };
+    mockManagedSearchProxyResult = platformError(402, "plan has no search");
     let byokFetchCalls = 0;
     globalThis.fetch = (async () => {
       byokFetchCalls += 1;
@@ -187,8 +191,7 @@ describe("web_search tool", () => {
     const result = await execute({ query: "billing query" });
 
     expect(result.isError).toBe(true);
-    expect(result.content).toContain("account balance");
-    expect(result.content).toContain("different web search provider");
+    expect(result.content).toContain("isn't included in this plan");
     expect(byokFetchCalls).toBe(0);
   });
 
@@ -501,55 +504,52 @@ describe("web_search tool", () => {
 
   // ---- Managed Brave provider -------------------------------------------
 
-  test("provider vellum uses Brave proxy without BYOK provider keys", async () => {
+  test("provider vellum uses managed search without BYOK provider keys", async () => {
     seedWebSearch(undefined, "vellum");
     mockManagedSearchProxyResult = {
       ok: true,
-      status: 200,
-      headers: { "content-type": "application/json" },
-      body: {
-        web: {
-          results: [
-            {
-              title: "Managed Result",
-              url: "https://example.com/managed",
-              description: "Managed Brave result",
-            },
-          ],
+      query: "managed query",
+      provider: "brave",
+      results: [
+        {
+          title: "Managed Result",
+          url: "https://example.com/managed",
+          snippet: "Managed Brave result",
         },
-      },
+      ],
     };
 
     const result = await execute({
       query: "managed query",
       count: 5,
+      country: "gb",
       offset: 2,
       freshness: "pw",
     });
 
     expect(result.isError).toBe(false);
     expect(result.content).toContain("Managed Result");
+    expect(result.content).toContain("Managed Brave result");
+    expect(result.activityMetadata.webSearch.resultCount).toBe(1);
     expect(mockManagedSearchProxyCalls).toHaveLength(1);
-    expect(mockManagedSearchProxyCalls[0]).toMatchObject({
-      provider: "brave",
-      request: {
-        method: "GET",
-        path: "/res/v1/web/search",
-        query: {
-          q: "managed query",
-          count: "5",
-          offset: "2",
-          freshness: "pw",
-        },
-        headers: {
-          Accept: "application/json",
-        },
-        body: null,
-      },
+    // Only q/count/country go to the platform; offset and freshness do not.
+    expect(mockManagedSearchProxyCalls[0].request).toEqual({
+      q: "managed query",
+      count: 5,
+      country: "GB",
     });
   });
 
-  test("managed Brave formats results like direct Brave", async () => {
+  test("an invalid country is dropped", async () => {
+    seedWebSearch(undefined, "vellum");
+    await execute({ query: "q", country: "United Kingdom" });
+    expect(mockManagedSearchProxyCalls[0].request).toEqual({
+      q: "q",
+      count: 10,
+    });
+  });
+
+  test("managed results format like direct Brave", async () => {
     const braveBody = {
       web: {
         results: [
@@ -557,8 +557,6 @@ describe("web_search tool", () => {
             title: "Same Result",
             url: "https://example.com/same",
             description: "Same description",
-            age: "1 day ago",
-            extra_snippets: ["Same snippet"],
           },
         ],
       },
@@ -579,9 +577,15 @@ describe("web_search tool", () => {
     mockBraveSecureKey = undefined;
     mockManagedSearchProxyResult = {
       ok: true,
-      status: 200,
-      headers: { "content-type": "application/json" },
-      body: braveBody,
+      query: "same query",
+      provider: "brave",
+      results: [
+        {
+          title: "Same Result",
+          url: "https://example.com/same",
+          snippet: "Same description",
+        },
+      ],
     };
 
     const managedResult = await execute({ query: "same query" });
@@ -593,7 +597,7 @@ describe("web_search tool", () => {
     );
   });
 
-  test("provider vellum passes abort signal to the platform proxy", async () => {
+  test("provider vellum passes abort signal to managed search", async () => {
     seedWebSearch(undefined, "vellum");
     const controller = new AbortController();
 
@@ -603,40 +607,55 @@ describe("web_search tool", () => {
     expect(mockManagedSearchProxyCalls[0].signal).toBe(controller.signal);
   });
 
-  test("provider vellum maps insufficient balance to a managed usage error", async () => {
+  test("402 and 403 map to a plan error", async () => {
     seedWebSearch(undefined, "vellum");
-    mockManagedSearchProxyResult = {
-      ok: false,
-      kind: "platform-error",
-      status: 402,
-      headers: { "content-type": "application/json" },
-      body: { detail: "Insufficient balance" },
-      message: "Managed search proxy returned status 402: Insufficient balance",
-    };
-
-    const result = await execute({ query: "billing query" });
-
-    expect(result.isError).toBe(true);
-    expect(result.content).toContain("Managed web search");
-    expect(result.content).toContain("account balance");
-    expect(result.content).toContain("different web search provider");
+    for (const status of [402, 403]) {
+      mockManagedSearchProxyResult = platformError(status, "refused");
+      const result = await execute({ query: "plan query" });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain(
+        "Web search isn't included in this plan",
+      );
+      expect(result.content).toContain("Do not retry");
+    }
   });
 
-  test("provider vellum maps proxied provider errors to a tool error", async () => {
+  test("503 maps to a non-retryable unavailable error carrying the detail", async () => {
     seedWebSearch(undefined, "vellum");
-    mockManagedSearchProxyResult = {
-      ok: true,
-      status: 400,
-      headers: { "content-type": "application/json" },
-      body: { error: "Bad upstream request" },
-    };
+    mockManagedSearchProxyResult = platformError(
+      503,
+      "search is not configured on this deployment",
+    );
 
-    const result = await execute({ query: "provider error query" });
+    const result = await execute({ query: "unconfigured query" });
 
     expect(result.isError).toBe(true);
     expect(result.content).toContain(
-      "Managed Brave Search provider returned status 400",
+      "Web search is unavailable on this deployment: search is not configured on this deployment",
     );
+    expect(result.content).toContain("Do not retry");
+  });
+
+  test("400 returns the platform's detail", async () => {
+    seedWebSearch(undefined, "vellum");
+    mockManagedSearchProxyResult = platformError(
+      400,
+      "that query is too long to search for",
+    );
+
+    const result = await execute({ query: "long query" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe("Error: that query is too long to search for");
+  });
+
+  test("429 maps to a rate-limit failure", async () => {
+    seedWebSearch(undefined, "vellum");
+    mockManagedSearchProxyResult = platformError(429, "slow down");
+
+    const result = await execute({ query: "busy query" });
+
+    expect(result.isError).toBe(true);
   });
 
   test("provider vellum returns a clear error when platform context is unavailable", async () => {
@@ -644,14 +663,15 @@ describe("web_search tool", () => {
     mockManagedSearchProxyResult = {
       ok: false,
       kind: "unavailable",
-      message: "Managed search proxy is unavailable in this environment.",
+      message: "Managed web search is unavailable in this environment.",
     };
 
     const result = await execute({ query: "local managed query" });
 
     expect(result.isError).toBe(true);
-    expect(result.content).toContain("Managed search proxy is unavailable");
-    expect(result.content).toContain("Log in to Vellum");
+    expect(result.content).toContain(
+      "Web search is unavailable on this deployment",
+    );
   });
 
   test("your-own mode keeps direct Brave BYOK behavior unchanged", async () => {

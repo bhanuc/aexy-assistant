@@ -529,20 +529,15 @@ describe("managed proxy integration — managed web search routing", () => {
       fetchUrls.push(String(url));
       return new Response(
         JSON.stringify({
-          status: 200,
-          headers: { "content-type": "application/json" },
-          body: {
-            web: {
-              results: [
-                {
-                  title: "Platform Result",
-                  url: "https://example.com/platform-result",
-                  description: "Returned by the managed Brave proxy.",
-                  age: "1 day ago",
-                },
-              ],
+          query: "managed kimi query",
+          provider: "brave",
+          results: [
+            {
+              title: "Platform Result",
+              url: "https://example.com/platform-result",
+              snippet: "Returned by the managed search endpoint.",
             },
-          },
+          ],
         }),
         {
           status: 200,
@@ -593,9 +588,7 @@ describe("managed proxy integration — managed web search routing", () => {
       expect(result.activityMetadata?.webSearch?.provider).toBe("brave");
       expect(result.activityMetadata?.webSearch?.resultCount).toBe(1);
 
-      expect(fetchUrls).toEqual([
-        `${PLATFORM_BASE}/v1/assistants/${PLATFORM_ASSISTANT_ID}/managed-search-proxy/brave/`,
-      ]);
+      expect(fetchUrls).toEqual([`${PLATFORM_BASE}/v1/managed/search`]);
     } finally {
       globalThis.fetch = originalFetch;
     }
