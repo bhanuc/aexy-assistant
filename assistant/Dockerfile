@@ -166,6 +166,31 @@ COPY meta/feature-flags /app/meta/feature-flags
 # in the image.
 RUN bun run scripts/smoke-container-workspace-dependencies.ts
 
+# Aexy: local memory embeddings, baked in. The daemon's embedding runtime
+# (onnxruntime-node, transformers.js) and the model otherwise download at first
+# use into /workspace/embedding-models, which needs npm + Hugging Face egress
+# from every pod and a multi-minute wait, and when that fails `auto` embeddings
+# fall through to the platform's Gemini proxy. This step installs the pinned,
+# integrity-checked runtime plus the int8 Xenova/bge-small-en-v1.5 model (pinned
+# Hugging Face revision, sha256 per file) into /opt/vellum-embedding, then
+# starts the real embed worker once and embeds a text past the 512-token limit,
+# so a missing native binary or model fails the build. /workspace is a volume
+# mounted over the image, hence /opt; embedding-runtime-manager.ts prefers this
+# directory (VELLUM_EMBEDDING_RUNTIME_DIR) when its version.json matches the
+# code. Build with --build-arg VELLUM_BAKE_EMBEDDINGS=false to skip it.
+ARG VELLUM_BAKE_EMBEDDINGS=true
+RUN if [ "$VELLUM_BAKE_EMBEDDINGS" = "true" ]; then \
+      set -eu; \
+      bun run scripts/bake-embedding-runtime.ts /opt/vellum-embedding; \
+      chmod -R a+rX /opt/vellum-embedding; \
+    fi
+ENV VELLUM_EMBEDDING_RUNTIME_DIR=/opt/vellum-embedding
+# int8 model (onnx/model_quantized.onnx) and a small ONNX thread budget: several
+# pods share a node's cores. Both can be overridden per deployment.
+ENV VELLUM_EMBEDDING_DTYPE=q8
+ENV VELLUM_ONNX_INTRA_OP_THREADS=2
+ENV VELLUM_ONNX_INTER_OP_THREADS=1
+
 # The repo-root .dockerignore decides which skills (and files) ship.
 COPY skills /app/skills
 

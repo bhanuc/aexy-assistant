@@ -6,6 +6,7 @@ import { isMemoryEnabled } from "../../config/memory-v3-gate.js";
 import type { AssistantConfig } from "../../config/types.js";
 import { PLATFORM_PROVIDER_META } from "../../providers/platform-proxy/constants.js";
 import { resolveManagedProxyContext } from "../../providers/platform-proxy/context.js";
+import { isManagedProviderUnavailable } from "../../providers/platform-proxy/managed-availability.js";
 import { getProviderKeyAsync } from "../../security/secure-keys.js";
 import { getLogger } from "../../util/logger.js";
 import {
@@ -547,6 +548,11 @@ function getCustomEmbeddingBackend(
 async function tryGetManagedGeminiBackend(
   config: AssistantConfig,
 ): Promise<EmbeddingBackend | undefined> {
+  // The platform said it holds no Gemini key; honour that for the backoff
+  // window instead of sending every embed to the same 503.
+  if (isManagedProviderUnavailable("gemini")) {
+    return undefined;
+  }
   const proxyCtx = await resolveManagedProxyContext();
   const meta = PLATFORM_PROVIDER_META["gemini"];
   if (!proxyCtx.enabled || !meta?.managed || !meta.proxyPath) {
@@ -568,6 +574,21 @@ async function tryGetManagedGeminiBackend(
       ),
     [...geminiCacheExtras(config), "managed"],
   );
+}
+
+/**
+ * A warm Gemini backend from the cache: the managed variant first (so it
+ * survives a transient proxy-context blip), then the direct one. The managed
+ * variant is skipped while the platform reports Gemini as not configured.
+ */
+function getCachedGemini(
+  config: AssistantConfig,
+): EmbeddingBackend | undefined {
+  const model = config.memory.embeddings.geminiModel;
+  const managed = isManagedProviderUnavailable("gemini")
+    ? undefined
+    : getCached("gemini", model, [...geminiCacheExtras(config), "managed"]);
+  return managed ?? getCached("gemini", model, geminiCacheExtras(config));
 }
 
 export interface EmbeddingBackendSelection {
@@ -625,10 +646,11 @@ export async function selectEmbeddingBackend(
     };
   }
 
-  // When managed proxy prerequisites are satisfied, insert managed-proxy Gemini
-  // at the front of the auto chain so platform assistants use Vellum-managed
-  // Gemini embeddings.
-  if (requested === "auto" || requested === "gemini") {
+  // An explicit `gemini` provider uses managed-proxy Gemini when the managed
+  // proxy prerequisites are satisfied. Under `auto` it is NOT tried first: the
+  // local model needs no key, no egress and no platform spend, so `auto` prefers
+  // it and reaches managed Gemini only through the chain below.
+  if (requested === "gemini") {
     const managed = await tryGetManagedGeminiBackend(config);
     if (managed) {
       return { backend: managed, reason: null };
@@ -688,18 +710,15 @@ export async function selectEmbeddingBackend(
       case "gemini": {
         const geminiKey = await getProviderKeyAsync("gemini");
         if (!geminiKey) {
-          // Check managed cache variant first so a warm managed backend
-          // survives transient proxy-context blips, then non-managed.
-          const cached =
-            getCached("gemini", config.memory.embeddings.geminiModel, [
-              ...geminiCacheExtras(config),
-              "managed",
-            ]) ??
-            getCached(
-              "gemini",
-              config.memory.embeddings.geminiModel,
-              geminiCacheExtras(config),
-            );
+          // No direct key: platform assistants use the managed proxy (unless
+          // the platform has said it holds no Gemini key).
+          const managed = await tryGetManagedGeminiBackend(config);
+          if (managed) {
+            return { backend: managed, reason: null };
+          }
+          // Otherwise a warm cached backend survives transient
+          // proxy-context blips.
+          const cached = getCachedGemini(config);
           if (cached) {
             return { backend: cached, reason: null };
           }
@@ -1156,18 +1175,8 @@ async function selectFallbackBackends(
           if (managed) {
             backends.push(managed);
           } else {
-            // Check managed cache variant first, then non-managed, so a warm
-            // managed backend survives transient proxy-context blips.
-            const cached =
-              getCached("gemini", config.memory.embeddings.geminiModel, [
-                ...geminiCacheExtras(config),
-                "managed",
-              ]) ??
-              getCached(
-                "gemini",
-                config.memory.embeddings.geminiModel,
-                geminiCacheExtras(config),
-              );
+            // A warm cached backend survives transient proxy-context blips.
+            const cached = getCachedGemini(config);
             if (cached) {
               backends.push(cached);
             }

@@ -27,6 +27,13 @@ import { getContainerCpuCores } from "./cgroup-cpu.js";
 export const ONNX_INTRA_OP_THREADS_ENV = "VELLUM_ONNX_INTRA_OP_THREADS";
 
 /**
+ * Environment variable carrying the inter-op cap (`session_options.interOpNumThreads`).
+ * Defaults to 1: these models run sequentially, and a pod sharing cores with
+ * others should never fan out across operators.
+ */
+export const ONNX_INTER_OP_THREADS_ENV = "VELLUM_ONNX_INTER_OP_THREADS";
+
+/**
  * Fraction of available cores one ML worker's intra-op pool may use. The
  * machine is shared with the daemon, the gateway, tool subprocesses, and
  * (because embed and rerank are separate processes) potentially a second ML
@@ -79,5 +86,6 @@ export function workerComputeEnv(): Record<string, string> {
     [ONNX_INTRA_OP_THREADS_ENV]:
       process.env[ONNX_INTRA_OP_THREADS_ENV] ??
       String(computeWorkerIntraOpThreads(getContainerCpuCores())),
+    [ONNX_INTER_OP_THREADS_ENV]: process.env[ONNX_INTER_OP_THREADS_ENV] ?? "1",
   };
 }

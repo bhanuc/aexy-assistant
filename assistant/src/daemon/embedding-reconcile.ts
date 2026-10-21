@@ -37,6 +37,7 @@ import {
 import {
   probeBackendDimension,
   readConceptPageCollectionDim,
+  readConceptPagePointCount,
 } from "../persistence/embeddings/embedding-identity.js";
 import { decideEmbeddingReconcile } from "../persistence/embeddings/reconcile-decision.js";
 import {
@@ -71,6 +72,12 @@ export type ReconcileOutcome =
 export interface ReconcileDeps {
   probeBackendDimension: typeof probeBackendDimension;
   readConceptPageCollectionDim: typeof readConceptPageCollectionDim;
+  /**
+   * Point count of the committed collection; must throw when it cannot be
+   * counted. Optional: when absent, a mismatched collection is treated as
+   * populated (never destroyed under `auto`).
+   */
+  readConceptPagePointCount?: typeof readConceptPagePointCount;
   decideEmbeddingReconcile: typeof decideEmbeddingReconcile;
   /** Commit the reconciled dimension to `memory.qdrant.vectorSize` on disk. */
   persistVectorSize: (dim: number) => void;
@@ -200,6 +207,7 @@ export function defaultDeps(config: AssistantConfig): ReconcileDeps {
   return {
     probeBackendDimension,
     readConceptPageCollectionDim,
+    readConceptPagePointCount,
     decideEmbeddingReconcile,
     persistVectorSize: defaultPersistVectorSize,
     // The committed dimension becomes visible to same-process readers through
@@ -328,11 +336,47 @@ export async function reconcileEmbeddingIdentity(
 
   const probe = await deps.probeBackendDimension(config);
 
-  const action = deps.decideEmbeddingReconcile({
+  let action = deps.decideEmbeddingReconcile({
     committedDim,
     probeDim: probe?.dim ?? null,
     configuredProvider: config.memory.embeddings.provider,
   });
+
+  // Under `auto` the decision declines to thrash a mismatched dimension. That is
+  // right for a populated collection, but a collection committed at one
+  // dimension that never received a point (e.g. the managed backend it was
+  // sized for never succeeded) is not worth preserving, and leaves every upsert
+  // from the reachable backend failing on a dimension mismatch. Recreate it at
+  // the reachable backend's dimension; keep the no-op, with a warning, when it
+  // holds points. A count that cannot be read counts as populated.
+  if (
+    action.kind === "noop" &&
+    config.memory.embeddings.provider === "auto" &&
+    committedDim != null &&
+    probe != null &&
+    probe.dim !== committedDim
+  ) {
+    let points: number | null = null;
+    try {
+      points = deps.readConceptPagePointCount
+        ? await deps.readConceptPagePointCount(config)
+        : null;
+    } catch (err) {
+      log.warn({ err }, "Could not count points in the mismatched collection");
+    }
+    if (points === 0) {
+      log.warn(
+        { committedDim, probeDim: probe.dim, provider: probe.provider },
+        "Committed embedding collection is empty and its dimension differs from the reachable backend; recreating it at the backend's dimension",
+      );
+      action = { kind: "migrate", fromDim: committedDim, toDim: probe.dim };
+    } else {
+      log.warn(
+        { committedDim, probeDim: probe.dim, provider: probe.provider, points },
+        "Embedding collection dimension differs from the reachable backend but the collection holds points; leaving it (set memory.embeddings.provider explicitly to migrate)",
+      );
+    }
+  }
 
   switch (action.kind) {
     case "noop": {

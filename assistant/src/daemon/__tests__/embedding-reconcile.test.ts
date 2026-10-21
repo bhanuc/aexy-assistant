@@ -78,8 +78,16 @@ function makeDeps(opts: {
   probeDim?: number | null;
   /** When set, `readConceptPageCollectionDim` rejects instead of resolving. */
   committedDimError?: Error;
+  /** Points in the committed collection; `Error` makes the count reject. */
+  points?: number | Error;
 }): ReconcileDeps {
   return {
+    readConceptPagePointCount: mock(async () => {
+      if (opts.points instanceof Error) {
+        throw opts.points;
+      }
+      return opts.points ?? 1;
+    }),
     probeBackendDimension: mock(async () =>
       opts.probeDim == null
         ? null
@@ -272,6 +280,52 @@ describe("reconcileEmbeddingIdentity", () => {
     expect(deps.ensureCollections).toHaveBeenCalledTimes(1);
     expect(deps.enqueueReembed).toHaveBeenCalledTimes(1);
     // Commit-fresh must never destroy.
+    expect(deps.recreateCollectionsAtDim).toHaveBeenCalledTimes(0);
+  });
+
+  test("auto: an EMPTY collection committed at a different dimension is recreated at the backend's dimension", async () => {
+    const deps = makeDeps({
+      // The pure decision declines to thrash under auto.
+      decision: { kind: "noop" },
+      committedDim: 3072,
+      probeDim: 384,
+      points: 0,
+    });
+
+    const outcome = await reconcileEmbeddingIdentity(fakeConfig("auto"), deps);
+
+    expect(outcome).toEqual({ action: "migrate", fromDim: 3072, toDim: 384 });
+    expect(deps.persistVectorSize).toHaveBeenCalledWith(384);
+    expect(deps.recreateCollectionsAtDim).toHaveBeenCalledWith(384);
+    expect(deps.enqueueReembed).toHaveBeenCalledTimes(1);
+  });
+
+  test("auto: a POPULATED collection at a different dimension stays a no-op", async () => {
+    const deps = makeDeps({
+      decision: { kind: "noop" },
+      committedDim: 3072,
+      probeDim: 384,
+      points: 12,
+    });
+
+    const outcome = await reconcileEmbeddingIdentity(fakeConfig("auto"), deps);
+
+    expect(outcome).toEqual({ action: "noop", dim: 3072 });
+    expect(deps.recreateCollectionsAtDim).toHaveBeenCalledTimes(0);
+    expect(deps.persistVectorSize).toHaveBeenCalledTimes(0);
+  });
+
+  test("auto: a collection whose points cannot be counted is never destroyed", async () => {
+    const deps = makeDeps({
+      decision: { kind: "noop" },
+      committedDim: 3072,
+      probeDim: 384,
+      points: new Error("qdrant down"),
+    });
+
+    const outcome = await reconcileEmbeddingIdentity(fakeConfig("auto"), deps);
+
+    expect(outcome).toEqual({ action: "noop", dim: 3072 });
     expect(deps.recreateCollectionsAtDim).toHaveBeenCalledTimes(0);
   });
 

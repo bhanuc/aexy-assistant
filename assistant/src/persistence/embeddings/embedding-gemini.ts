@@ -1,3 +1,8 @@
+import {
+  isManagedNotConfiguredResponse,
+  ManagedProviderNotConfiguredError,
+  markManagedProviderUnavailable,
+} from "../../providers/platform-proxy/managed-availability.js";
 import { getLogger } from "../../util/logger.js";
 import type {
   EmbeddingBackend,
@@ -199,6 +204,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
           throw err;
         }
       }
+      this.throwIfManagedNotConfigured(response.status, responseBody);
       if (BATCH_ROUTE_UNAVAILABLE_STATUSES.has(response.status)) {
         this.batchRouteUnavailable = true;
         log.warn(
@@ -275,6 +281,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     });
     if (!response.ok) {
       const responseBody = await response.text();
+      this.throwIfManagedNotConfigured(response.status, responseBody);
       throw new Error(
         `Gemini embeddings request failed (${response.status}): ${responseBody}`,
       );
@@ -285,6 +292,19 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
       throw new Error("Gemini embeddings response missing vector values");
     }
     return values;
+  }
+
+  /**
+   * The platform answered that it holds no Gemini key. That is a property of
+   * the deployment, so record it (the backend chain skips managed Gemini for a
+   * while) and throw a distinct error instead of letting the caller re-send the
+   * batch one text per call, each to the same refusal.
+   */
+  private throwIfManagedNotConfigured(status: number, body: string): void {
+    if (this.managed && isManagedNotConfiguredResponse(status, body)) {
+      markManagedProviderUnavailable("gemini", status);
+      throw new ManagedProviderNotConfiguredError("gemini", status);
+    }
   }
 
   /** The model's `:embedContent` or `:batchEmbedContents` URL, direct or via the managed proxy. */

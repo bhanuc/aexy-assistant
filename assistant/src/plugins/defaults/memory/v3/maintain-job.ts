@@ -89,6 +89,7 @@ import { getMemoryCheckpoint } from "../../../../persistence/checkpoints.js";
 import { EmbeddingBackendUnavailableError } from "../../../../persistence/embeddings/embedding-backend.js";
 import { EmbeddingBillingBlockError } from "../../../../persistence/embeddings/embedding-billing-breaker.js";
 import type { MemoryJob } from "../../../../persistence/jobs-store.js";
+import { ManagedProviderNotConfiguredError } from "../../../../providers/platform-proxy/managed-availability.js";
 import { executeDeleteManagedSkill } from "../../../../tools/skills/delete-managed.js";
 import { embedWithBackend } from "../embeddings.js";
 import { getLogger } from "../logging.js";
@@ -881,7 +882,8 @@ export async function backfillAllSections(
       // advanced, so the next pass retries from here once the backend recovers.
       if (
         err instanceof EmbeddingBackendUnavailableError ||
-        err instanceof EmbeddingBillingBlockError
+        err instanceof EmbeddingBillingBlockError ||
+        err instanceof ManagedProviderNotConfiguredError
       ) {
         throw err;
       }

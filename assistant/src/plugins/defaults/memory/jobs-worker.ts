@@ -59,6 +59,10 @@ import {
   resetRunningJobsToPending,
   SLOW_LLM_JOB_TYPES,
 } from "../../../persistence/jobs-store.js";
+import {
+  managedProviderBackoffRemainingMs,
+  ManagedProviderNotConfiguredError,
+} from "../../../providers/platform-proxy/managed-availability.js";
 import { isJobQueueResolution, type JobHandler } from "../../types.js";
 import { sweepOrphanConversationMemoryTables } from "./conversation-memory-orphan-sweep.js";
 import { getLogger } from "./logging.js";
@@ -154,6 +158,22 @@ class SweepPostponedOffV1Error extends Error {
  * short enough that a rollback to v1 runs the cleanup within the same day.
  */
 const SWEEP_POSTPONE_OFF_V1_MS = 6 * 60 * 60 * 1000;
+
+/** Longest a job waits out a managed provider the platform says is not configured. */
+const MANAGED_NOT_CONFIGURED_MAX_RESCHEDULE_MS = 30 * 60 * 1000;
+
+/**
+ * Delay for a job whose embed hit a managed provider the platform has not
+ * configured: the rest of that provider's backoff window, capped, floored at a
+ * minute. Rescheduling spends neither an attempt nor a deferral, so a deployment
+ * with no key never walks its backlog into the failed state.
+ */
+function managedNotConfiguredDelayMs(err: ManagedProviderNotConfiguredError) {
+  return Math.min(
+    MANAGED_NOT_CONFIGURED_MAX_RESCHEDULE_MS,
+    Math.max(60_000, managedProviderBackoffRemainingMs(err.provider)),
+  );
+}
 
 /**
  * Job types whose handlers have been removed. Existing rows may still sit in
@@ -452,6 +472,15 @@ export async function runMemoryJobsOnce(
         // A billing block (402) is deterministic — every subsequent embed
         // call will fail identically. Defer the remaining embed jobs in
         // this batch instead of burning a network round-trip on each one.
+        if (err instanceof ManagedProviderNotConfiguredError) {
+          // Same story as a billing block: every remaining embed in this group
+          // would reach the same refusal, so park them for the same window.
+          const delay = managedNotConfiguredDelayMs(err);
+          for (const remaining of group.slice(group.indexOf(job) + 1)) {
+            rescheduleMemoryJob(remaining.id, delay);
+          }
+          break;
+        }
         if (
           err instanceof EmbeddingBillingBlockError ||
           (embedSet.has(job.type) && extractHttpStatus(err) === 402)
@@ -576,6 +605,15 @@ function handleJobError(job: MemoryJob, err: unknown): void {
     log.debug(
       { jobId: job.id, type: job.type },
       "Cacheless graph-node sweep held pending while v1 is not the live tier",
+    );
+    return;
+  }
+
+  if (err instanceof ManagedProviderNotConfiguredError) {
+    rescheduleMemoryJob(job.id, managedNotConfiguredDelayMs(err));
+    log.debug(
+      { jobId: job.id, type: job.type, provider: err.provider },
+      "Managed provider not configured on this platform, job rescheduled",
     );
     return;
   }
