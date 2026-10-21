@@ -28,7 +28,7 @@ import {
   resolveProviderApiUrl,
   searchResultSnippet,
 } from "./firecrawl-compat.js";
-import type { ManagedSearchProxyResult } from "./managed-search-proxy.js";
+import type { ManagedSearchResult } from "./managed-search-proxy.js";
 import {
   classifyWebSearchFailure,
   logWebSearchBackendFailure,
@@ -67,6 +67,8 @@ interface WebSearchAdapterArgs {
   count: number;
   offset: number;
   freshness: string | undefined;
+  /** Two-letter country code; only the managed (platform) search honours it. */
+  country?: string;
   apiKey: string;
   signal?: AbortSignal;
 }
@@ -801,78 +803,38 @@ async function executeBraveSearch(
 async function executeManagedBraveSearch(
   query: string,
   count: number,
-  offset: number,
-  freshness: string | undefined,
+  country: string | undefined,
   signal?: AbortSignal,
 ): Promise<ToolExecutionResult> {
-  const { callManagedSearchProxy } = await import("./managed-search-proxy.js");
+  const { callManagedSearch } = await import("./managed-search-proxy.js");
   const startedAt = Date.now();
-  const proxyResult = await callManagedSearchProxy(
-    "brave",
-    {
-      method: "GET",
-      path: BRAVE_SEARCH_PATH,
-      query: braveQueryParams(query, count, offset, freshness),
-      headers: {
-        Accept: "application/json",
-      },
-      body: null,
-    },
+  // The platform takes only q/count/country; offset and freshness have no
+  // managed equivalent and are not sent.
+  const result = await callManagedSearch(
+    { q: query, count, ...(country ? { country } : {}) },
     signal,
   );
 
-  if (!proxyResult.ok) {
-    // Keep billing/auth/unavailable mapping as specific copy; route genuine
-    // platform 5xx (transport-level failures) to the friendly backend helper.
-    if (proxyResult.kind === "platform-error" && proxyResult.status >= 500) {
-      return backendFailureResult(
-        query,
-        "brave",
-        startedAt,
-        {
-          statusCode: proxyResult.status,
-          error: rawBodyDetail(proxyResult.body),
-        },
-        managedSearchProxyErrorMessage(proxyResult),
-      );
-    }
-    return errorResult(
-      query,
-      "brave",
-      startedAt,
-      managedSearchProxyErrorMessage(proxyResult),
-    );
+  if (result.ok) {
+    const braveShaped: BraveSearchResponse = {
+      web: {
+        results: result.results.map((r) => ({
+          title: r.title,
+          url: r.url,
+          description: r.snippet,
+        })),
+      },
+    };
+    return successfulBraveResult(braveShaped, query, startedAt);
   }
 
-  if (proxyResult.status >= 200 && proxyResult.status < 300) {
-    return successfulBraveResult(
-      proxyResult.body as BraveSearchResponse,
-      query,
-      startedAt,
-    );
-  }
-
-  if (proxyResult.status === 401 || proxyResult.status === 403) {
-    return errorResult(
-      query,
-      "brave",
-      startedAt,
-      "Managed Brave Search is not authenticated correctly. This is a Vellum platform configuration issue.",
-    );
-  }
-
-  if (proxyResult.status === 429 || proxyResult.status >= 500) {
+  if (result.kind === "platform-error" && result.status === 429) {
     return backendFailureResult(
       query,
       "brave",
       startedAt,
-      {
-        statusCode: proxyResult.status,
-        error: rawBodyDetail(proxyResult.body),
-      },
-      proxyResult.status === 429
-        ? "Managed Brave Search rate limit exceeded. Try again shortly."
-        : `Managed Brave Search provider returned status ${proxyResult.status}`,
+      { statusCode: 429, error: result.detail },
+      "Managed web search rate limit exceeded. Try again shortly.",
     );
   }
 
@@ -880,26 +842,34 @@ async function executeManagedBraveSearch(
     query,
     "brave",
     startedAt,
-    `Managed Brave Search provider returned status ${proxyResult.status}`,
+    managedSearchErrorMessage(result),
   );
 }
 
-function managedSearchProxyErrorMessage(
-  result: Exclude<ManagedSearchProxyResult, { ok: true }>,
+/**
+ * Wording for the model. Unavailable/not-included cases say not to retry so
+ * the model stops calling the tool and answers without it.
+ */
+function managedSearchErrorMessage(
+  result: Exclude<ManagedSearchResult, { ok: true }>,
 ): string {
   if (result.kind === "unavailable") {
-    return `${result.message} Log in to Vellum or choose a different web search provider in Settings.`;
+    return `Web search is unavailable on this deployment: ${result.message} Do not retry web_search; answer without it.`;
   }
-
-  if (result.kind === "platform-error" && result.status === 402) {
-    return "Managed web search is unavailable because your Vellum account balance is too low. Add funds or choose a different web search provider in Settings.";
+  if (result.kind === "invalid-response") {
+    return `Web search is unavailable on this deployment: ${result.message} Do not retry web_search; answer without it.`;
   }
-
-  if (result.kind === "platform-error") {
-    return `Managed web search platform request failed: ${result.message}`;
+  const detail = result.detail ?? `status ${result.status}`;
+  if (result.status === 402 || result.status === 403) {
+    return "Web search isn't included in this plan. Do not retry web_search; answer without it.";
   }
-
-  return result.message;
+  if (result.status === 400) {
+    return detail;
+  }
+  if (result.status === 503 || result.status === 502 || result.status === 504) {
+    return `Web search is unavailable on this deployment: ${detail}. Do not retry web_search; answer without it.`;
+  }
+  return `Managed web search failed: ${detail}`;
 }
 
 async function executePerplexitySearch(
@@ -1382,8 +1352,8 @@ const managedBraveSearchAdapter: WebSearchAdapter = {
   id: "brave",
   providerKeyName: "brave",
   fallbackOrder: 2,
-  execute: ({ query, count, offset, freshness, signal }) =>
-    executeManagedBraveSearch(query, count, offset, freshness, signal),
+  execute: ({ query, count, country, signal }) =>
+    executeManagedBraveSearch(query, count, country, signal),
 };
 
 const tavilySearchAdapter: WebSearchAdapter = {
@@ -1474,6 +1444,11 @@ export const webSearchTool = {
         description:
           'Filter by recency: "pd" (past day), "pw" (past week), "pm" (past month), "py" (past year). Used with Brave, Tavily, Firecrawl, Keenable, and fastCRW providers.',
       },
+      country: {
+        type: "string",
+        description:
+          'Optional two-letter country code (e.g. "GB") to localise results. Only used by managed web search.',
+      },
     },
     required: ["query"],
   },
@@ -1506,15 +1481,23 @@ export const webSearchTool = {
         : 0;
     const freshness =
       typeof input.freshness === "string" ? input.freshness : undefined;
+    const country =
+      typeof input.country === "string" && /^[A-Za-z]{2}$/.test(input.country)
+        ? input.country.toUpperCase()
+        : undefined;
 
     const executeManagedSearch = async (): Promise<ToolExecutionResult> => {
       try {
-        log.debug({ query, provider: "brave" }, "Executing managed web search");
+        log.debug(
+          { query, provider: "managed" },
+          "Executing managed web search",
+        );
         return await managedBraveSearchAdapter.execute({
           query,
           count,
           offset,
           freshness,
+          country,
           apiKey: "",
           signal: context.signal,
         });
