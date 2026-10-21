@@ -110,3 +110,21 @@ export async function readConceptPageCollectionDim(
   }
   return size;
 }
+
+/**
+ * Number of points in the v2 concept-page collection. Unlike the substrate's
+ * `countConceptPagePoints` (which reports 0 on failure so a caller rebuilds),
+ * this THROWS on any failure: the reconcile uses it to decide whether a
+ * dimension-mismatched collection is safe to destroy, and "could not count"
+ * must never read as "empty".
+ */
+export async function readConceptPagePointCount(
+  config: AssistantConfig,
+): Promise<number> {
+  const client = new QdrantClient({
+    url: resolveQdrantUrl(config),
+    checkCompatibility: false,
+  });
+  const result = await client.count(MEMORY_V2_COLLECTION, { exact: true });
+  return result.count;
+}
